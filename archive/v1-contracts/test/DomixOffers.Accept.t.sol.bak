@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {DomixTestBase} from "./DomixBase.t.sol";
+import "./DomixImports.sol";
+
+contract DomixOffersAcceptTest is DomixTestBase {
+    uint256 internal id;
+    uint256 internal oid;
+    uint256 internal constant PRICE = 500 * ONE;
+
+    function setUp() public override {
+        super.setUp();
+        id = _mint(reg, "alice", alice);
+        _approveNFT(reg, alice, address(offers), id);
+        vm.prank(bob);
+        oid = offers.makeOffer(address(reg), id, PRICE, 2 days);
+    }
+
+    function test_Accept_SettlesWithExactFeeMathAndAccounting() public {
+        uint256 fee = PRICE * FEE_BPS / 10_000;
+        uint256 a0 = usdc.balanceOf(alice);
+        uint256 b0 = usdc.balanceOf(bob);
+        uint256 t0 = usdc.balanceOf(treasury);
+
+        vm.expectEmit(true, true, true, true, address(offers));
+        emit DomixOffers.OfferAccepted(oid, alice, bob, PRICE, fee);
+        vm.prank(alice);
+        offers.acceptOffer(oid);
+
+        assertEq(reg.ownerOf(id), bob);
+        assertEq(usdc.balanceOf(alice), a0 + PRICE - fee);
+        assertEq(usdc.balanceOf(treasury), t0 + fee);
+        assertEq(usdc.balanceOf(bob), b0 - PRICE);
+        assertEq(usdc.balanceOf(address(offers)), 0);
+        assertEq(offers.getOffer(oid).status, 1);
+        // marketplace accounting through the settler role
+        assertEq(market.salesCount(), 1);
+        assertEq(market.totalVolume(), PRICE);
+        assertEq(market.totalFees(), fee);
+    }
+
+    function test_Accept_ClearsStaleMarketplaceListing() public {
+        _approveNFT(reg, alice, address(market), id); // overrides single approval
+        _list(alice, id, PRICE * 2, 3 days);
+        // listing approval replaced offers approval -> use approvalForAll for offers
+        vm.prank(alice);
+        reg.setApprovalForAll(address(offers), true);
+        vm.prank(alice);
+        offers.acceptOffer(oid);
+        assertEq(market.getListing(address(reg), id).seller, address(0));
+    }
+
+    function test_Accept_ZeroFeeSkipsTreasury() public {
+        vm.prank(owner);
+        market.setFee(0);
+        uint256 a0 = usdc.balanceOf(alice);
+        vm.prank(alice);
+        offers.acceptOffer(oid);
+        assertEq(usdc.balanceOf(alice), a0 + PRICE);
+        assertEq(usdc.balanceOf(treasury), 0);
+    }
+
+    function test_Accept_UsesFeeAtAcceptTime() public {
+        vm.prank(owner);
+        market.setFee(1000);
+        vm.prank(alice);
+        offers.acceptOffer(oid);
+        assertEq(usdc.balanceOf(treasury), PRICE / 10);
+    }
+
+    function test_Accept_StillSettlesWhenOffersNotSettler_EmitsAccountingFailed() public {
+        vm.prank(owner);
+        market.setSettler(address(offers), false);
+        vm.expectEmit(true, false, false, false, address(offers));
+        emit DomixOffers.SaleAccountingFailed(oid);
+        vm.prank(alice);
+        offers.acceptOffer(oid);
+        assertEq(reg.ownerOf(id), bob);
+        assertEq(market.salesCount(), 0);
+    }
+
+    function test_Accept_RevertsExpired() public {
+        skip(2 days);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.Expired.selector);
+        offers.acceptOffer(oid);
+        skip(0);
+    }
+
+    function test_Accept_ValidUntilLastSecond() public {
+        skip(2 days - 1);
+        vm.prank(alice);
+        offers.acceptOffer(oid);
+        assertEq(reg.ownerOf(id), bob);
+    }
+
+    function test_Accept_RevertsForNonOwner() public {
+        vm.prank(carol);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        offers.acceptOffer(oid);
+    }
+
+    function test_Accept_RevertsAfterOwnerChange_NewOwnerCanAccept() public {
+        vm.prank(alice);
+        reg.transferFrom(alice, carol, id);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        offers.acceptOffer(oid);
+
+        vm.prank(carol);
+        reg.approve(address(offers), id);
+        uint256 c0 = usdc.balanceOf(carol);
+        vm.prank(carol);
+        offers.acceptOffer(oid);
+        assertEq(reg.ownerOf(id), bob);
+        assertEq(usdc.balanceOf(carol), c0 + PRICE - PRICE * FEE_BPS / 10_000);
+    }
+
+    function test_Accept_RevertsSelfTradeWhenOffererBecameOwner() public {
+        vm.prank(alice);
+        reg.transferFrom(alice, bob, id);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.SelfTrade.selector);
+        offers.acceptOffer(oid);
+    }
+
+    function test_Accept_InsufficientAllowanceAtAccept_RevertsAtomically() public {
+        vm.prank(bob);
+        usdc.approve(address(offers), PRICE - 1);
+        vm.prank(alice);
+        vm.expectRevert();
+        offers.acceptOffer(oid);
+        assertEq(reg.ownerOf(id), alice);
+        assertEq(offers.getOffer(oid).status, 0, "offer remains active");
+        assertEq(usdc.balanceOf(treasury), 0);
+        assertEq(market.salesCount(), 0);
+    }
+
+    function test_Accept_AllowanceCoversPriceButNotFee_RevertsAtomically() public {
+        // allowance covers proceeds only; fee pull fails -> everything rolls back
+        uint256 fee = PRICE * FEE_BPS / 10_000;
+        vm.prank(bob);
+        usdc.approve(address(offers), PRICE - fee);
+        uint256 a0 = usdc.balanceOf(alice);
+        vm.prank(alice);
+        vm.expectRevert();
+        offers.acceptOffer(oid);
+        assertEq(usdc.balanceOf(alice), a0);
+        assertEq(reg.ownerOf(id), alice);
+    }
+
+    function test_Accept_InsufficientBalanceAtAccept_Reverts() public {
+        uint256 bal = usdc.balanceOf(bob);
+        vm.prank(bob);
+        usdc.transfer(stranger, bal);
+        vm.prank(alice);
+        vm.expectRevert();
+        offers.acceptOffer(oid);
+        assertEq(reg.ownerOf(id), alice);
+    }
+
+    function test_Accept_OffererBlacklistedReverts() public {
+        usdc.setBlacklisted(bob, true);
+        vm.prank(alice);
+        vm.expectRevert();
+        offers.acceptOffer(oid);
+        assertEq(offers.getOffer(oid).status, 0);
+    }
+
+    function test_Accept_RevertsWithoutNFTApproval() public {
+        _approveNFT(reg, alice, address(0), id);
+        vm.prank(alice);
+        vm.expectRevert();
+        offers.acceptOffer(oid);
+        assertEq(reg.ownerOf(id), alice);
+        assertEq(offers.getOffer(oid).status, 0);
+    }
+
+    function test_Accept_RevertsWhenCollectionDelisted() public {
+        vm.prank(owner);
+        market.setCollection(address(reg), false, true);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.CollectionNotAllowed.selector);
+        offers.acceptOffer(oid);
+    }
+
+    function test_Accept_RevertsWhenNameExpiryInsideBuffer() public {
+        reg.setExpiry(id, block.timestamp + 7 days); // == now + buffer, not strictly after
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidExpiry.selector);
+        offers.acceptOffer(oid);
+        reg.setExpiry(id, block.timestamp + 7 days + 1);
+        vm.prank(alice);
+        offers.acceptOffer(oid);
+        assertEq(reg.ownerOf(id), bob);
+    }
+
+    function test_Accept_RevertsWhenOffersPaused() public {
+        vm.prank(owner);
+        offers.pause();
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        offers.acceptOffer(oid);
+    }
+
+    function test_Accept_RevertsWhenMarketplacePaused() public {
+        vm.prank(owner);
+        market.pause();
+        vm.prank(alice);
+        vm.expectRevert(DomixOffers.MarketplacePaused.selector);
+        offers.acceptOffer(oid);
+    }
+
+    function test_Accept_RevertsOnReplayAndAfterCancelOrReject() public {
+        vm.prank(alice);
+        offers.acceptOffer(oid);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        offers.acceptOffer(oid);
+
+        vm.prank(carol);
+        uint256 o2 = offers.makeOffer(address(reg), id, PRICE, 1 days);
+        vm.prank(carol);
+        offers.cancelOffer(o2);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        offers.acceptOffer(o2);
+    }
+
+    function test_Accept_InvalidId() public {
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        offers.acceptOffer(0);
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        offers.acceptOffer(42);
+    }
+
+    function test_Accept_OffererContractRejectingERC721_RevertsAtomically() public {
+        ContractBidder cb = _newBidder();
+        cb.approveToken(IERC20(address(usdc)), address(offers), type(uint256).max);
+        bytes memory ret = cb.exec(address(offers), abi.encodeCall(offers.makeOffer, (address(reg), id, PRICE, 1 days)));
+        uint256 o2 = abi.decode(ret, (uint256));
+        uint256 before_ = usdc.balanceOf(address(cb));
+        vm.prank(alice);
+        vm.expectRevert();
+        offers.acceptOffer(o2);
+        assertEq(usdc.balanceOf(address(cb)), before_);
+        assertEq(reg.ownerOf(id), alice);
+    }
+
+    function test_Accept_ReentrancyFromReceiverHookBlocked() public {
+        ContractBidder cb = _newBidder();
+        cb.setAccept(true);
+        cb.approveToken(IERC20(address(usdc)), address(offers), type(uint256).max);
+        bytes memory ret = cb.exec(address(offers), abi.encodeCall(offers.makeOffer, (address(reg), id, PRICE, 1 days)));
+        uint256 o2 = abi.decode(ret, (uint256));
+        // on receipt, attempt to accept the *other* offer (bob's) -> must be blocked by nonReentrant
+        cb.setHook(address(offers), abi.encodeCall(offers.acceptOffer, (oid)));
+        vm.prank(alice);
+        offers.acceptOffer(o2);
+        assertTrue(cb.hookCalled());
+        assertFalse(cb.hookCallSucceeded());
+        assertEq(reg.ownerOf(id), address(cb));
+        assertEq(offers.getOffer(oid).status, 0);
+    }
+
+    function testFuzz_Accept_ExactSplit(uint256 price, uint16 bps) public {
+        price = bound(price, 10_000, 900_000 * ONE);
+        bps = uint16(bound(bps, 0, 1000));
+        vm.prank(owner);
+        market.setFee(bps);
+        vm.prank(carol);
+        uint256 o2 = offers.makeOffer(address(reg), id, price, 1 days);
+        uint256 fee = price * bps / 10_000;
+        uint256 a0 = usdc.balanceOf(alice);
+        uint256 c0 = usdc.balanceOf(carol);
+        uint256 t0 = usdc.balanceOf(treasury);
+        vm.prank(alice);
+        offers.acceptOffer(o2);
+        assertEq(usdc.balanceOf(alice) - a0, price - fee);
+        assertEq(usdc.balanceOf(treasury) - t0, fee);
+        assertEq(c0 - usdc.balanceOf(carol), price);
+        assertEq(reg.ownerOf(id), carol);
+    }
+}

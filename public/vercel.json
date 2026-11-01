@@ -1,0 +1,7 @@
+{
+  "rewrites": [
+    { "source": "/rpc/5042", "destination": "https://rpc.mainnet.arc.io" },
+    { "source": "/rpc/5042002", "destination": "https://rpc.testnet.arc.io" },
+    { "source": "/((?!assets/|api/|rpc/).*)", "destination": "/index.html" }
+  ]
+}

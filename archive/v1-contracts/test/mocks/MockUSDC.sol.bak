@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+/// @notice Plain six-decimal USDC stand-in with open mint.
+contract MockUSDC is ERC20 {
+    constructor() ERC20("Mock USDC", "mUSDC") {}
+
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+/// @notice USDC variant that can blacklist accounts (transfers from/to revert) or
+///         make transfers *to* an account burn all gas (griefing recipient).
+contract BlacklistUSDC is MockUSDC {
+    mapping(address => bool) public blacklisted;
+    mapping(address => bool) public gasGrief;
+
+    error Blacklisted(address account);
+
+    function setBlacklisted(address account, bool flag) external {
+        blacklisted[account] = flag;
+    }
+
+    function setGasGrief(address account, bool flag) external {
+        gasGrief[account] = flag;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (blacklisted[from]) revert Blacklisted(from);
+        if (blacklisted[to]) revert Blacklisted(to);
+        if (gasGrief[to]) {
+            // burn every unit of gas supplied to this call
+            while (true) {}
+        }
+        super._update(from, to, value);
+    }
+}

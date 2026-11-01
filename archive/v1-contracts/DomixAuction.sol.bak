@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IDomixMarketplace, DomixAdmin, DomixValidation} from "./interfaces/IDomix.sol";
+
+/// @title DOMIX English auctions for existing registrar NFTs
+/// @notice NFTs and bids are escrowed. There is no administrator withdrawal or asset rescue.
+/// @dev Uses standard non-rebasing, non-fee-on-transfer USDC. Funds are pulled only by bidder consent.
+///      Administrators pause Marketplace, Offers and Auction separately.
+///      Auction pause blocks only createAuction: administrators stop new auctions by pausing.
+///      Bidding, settlement, refunds, cancellation and claims intentionally stay live while paused
+///      so deadlines remain fair and pausing can never freeze funds.
+contract DomixAuction is DomixAdmin, ReentrancyGuard, IERC721Receiver {
+    using SafeERC20 for IERC20;
+    enum Status { Active, Settled, Cancelled, Failed }
+    struct Auction {
+        address seller;
+        address collection;
+        uint256 tokenId;
+        uint128 startPrice;
+        uint128 minIncrement;
+        uint128 highestBid;
+        address highestBidder;
+        uint64 endTime;
+        uint64 hardEnd;
+        uint16 feeBps;
+        uint8 status;
+        bool hasExpiry;
+    }
+
+    IDomixMarketplace public immutable marketplace;
+    IERC20 public immutable usdc;
+    uint256 public nextAuctionId = 1;
+    mapping(uint256 => Auction) private _auctions;
+    mapping(address => uint256) public pendingReturns;
+    mapping(uint256 => bool) private _undeliveredClaimed;
+    bool private _receiving;
+    uint256 private _receivingId;
+
+    error MarketplacePaused();
+    error BidTooLow(uint256 submitted, uint256 required);
+    error NotEnded();
+    error NotSeller();
+    error HasBids();
+    error UnexpectedNFT();
+    error NothingToWithdraw();
+
+    event AuctionCreated(uint256 indexed id, address indexed collection, uint256 indexed tokenId, address seller, uint256 startPrice, uint256 minIncrement, uint64 endTime, uint64 hardEnd, uint16 feeBps);
+    event BidPlaced(uint256 indexed id, address indexed bidder, uint256 amount);
+    event AuctionExtended(uint256 indexed id, uint64 endTime);
+    event PaymentSent(address indexed recipient, uint256 amount);
+    event RefundCredited(address indexed recipient, uint256 amount);
+    event RefundWithdrawn(address indexed recipient, uint256 amount);
+    event AuctionSettled(uint256 indexed id, address indexed seller, address indexed winner, uint256 price, uint256 fee);
+    event AuctionCancelled(uint256 indexed id, address indexed seller);
+    event SaleAccountingFailed(uint256 indexed id);
+    event AuctionFailed(uint256 indexed id, address indexed winner, uint256 bid);
+    event UndeliveredClaimed(uint256 indexed id, address indexed seller);
+
+    constructor(IDomixMarketplace marketplace_, address owner_) DomixAdmin(owner_) {
+        DomixValidation.requireContract(address(marketplace_));
+        marketplace = marketplace_;
+        IERC20 token = marketplace_.usdc();
+        DomixValidation.requireContract(address(token));
+        usdc = token;
+    }
+
+    modifier whenActive() {
+        _requireNotPaused();
+        _;
+    }
+
+    /// @notice Escrows an approved NFT. Expiry covers the full possible anti-sniping extension.
+    function createAuction(address collection, uint256 tokenId, uint256 startPrice, uint256 minIncrement, uint256 duration)
+        external nonReentrant whenActive returns (uint256 id)
+    {
+        bool hasExpiry = DomixValidation.allowed(marketplace, collection);
+        DomixValidation.requirePrice(startPrice);
+        DomixValidation.requirePrice(minIncrement);
+        if (duration < 1 hours || duration > 14 days) revert DomixValidation.InvalidDuration();
+        if (DomixValidation.currentOwner(collection, tokenId) != msg.sender) revert DomixValidation.NotTokenOwner();
+        uint64 end = uint64(block.timestamp + duration);
+        uint64 hard = end + uint64(24 hours);
+        if (hasExpiry && !DomixValidation.expiryAfter(
+            collection, tokenId, uint256(hard) + marketplace.minExpiryBuffer()
+        )) revert DomixValidation.InvalidExpiry();
+        uint16 rate = marketplace.feeBps();
+        if (rate > MAX_FEE_BPS) revert DomixValidation.InvalidFee();
+        id = nextAuctionId++;
+        Auction storage entry = _auctions[id];
+        entry.seller = msg.sender;
+        entry.collection = collection;
+        entry.tokenId = tokenId;
+        entry.startPrice = uint128(startPrice);
+        entry.minIncrement = uint128(minIncrement);
+        entry.endTime = end;
+        entry.hardEnd = hard;
+        entry.feeBps = rate;
+        entry.hasExpiry = hasExpiry;
+        _receivingId = id;
+        _receiving = true;
+        IERC721(collection).safeTransferFrom(msg.sender, address(this), tokenId);
+        _receiving = false;
+        delete _receivingId;
+        if (DomixValidation.currentOwner(collection, tokenId) != address(this)) revert UnexpectedNFT();
+        emit AuctionCreated(id, collection, tokenId, msg.sender, startPrice, minIncrement, end, hard, rate);
+    }
+
+    /// @notice Pulls an explicitly approved bid and refunds the displaced bidder without blocking bids.
+    function bid(uint256 id, uint256 amount) external nonReentrant {
+        Auction storage entry = _active(id);
+        uint64 end = entry.endTime;
+        if (block.timestamp >= end) revert DomixValidation.Expired();
+        if (entry.hasExpiry) DomixValidation.requireUnexpired(entry.collection, entry.tokenId);
+        if (msg.sender == entry.seller) revert DomixValidation.SelfTrade();
+        DomixValidation.requirePrice(amount);
+        uint256 required = _minimum(entry);
+        if (amount < required) revert BidTooLow(amount, required);
+        address previousBidder = entry.highestBidder;
+        uint256 previousBid = entry.highestBid;
+        entry.highestBidder = msg.sender;
+        entry.highestBid = uint128(amount);
+        if (end - block.timestamp < 10 minutes) {
+            uint256 extended = block.timestamp + 10 minutes;
+            if (extended > entry.hardEnd) extended = entry.hardEnd;
+            if (extended > end) {
+                entry.endTime = uint64(extended);
+                emit AuctionExtended(id, uint64(extended));
+            }
+        }
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+        if (previousBidder != address(0)) _pushOrCredit(previousBidder, previousBid);
+        emit BidPlaced(id, msg.sender, amount);
+    }
+
+    /// @notice Permissionless after endTime, even while paused.
+    /// @dev Collection delisting does not block settlement. Delivery uses only safe transfer;
+    ///      expired/unreadable name expiry or failed winner delivery refunds the full bid.
+    ///      Sale accounting is best effort.
+    function settle(uint256 id) external nonReentrant {
+        Auction storage entry = _active(id);
+        if (block.timestamp < entry.endTime) revert NotEnded();
+        entry.status = uint8(Status.Settled);
+        uint256 fee;
+        if (entry.highestBidder != address(0)) {
+            if ((entry.hasExpiry && !DomixValidation.expiryAfter(entry.collection, entry.tokenId, block.timestamp))
+                || !_deliver(entry.collection, entry.highestBidder, entry.tokenId)) {
+                entry.status = uint8(Status.Failed);
+                _pushOrCredit(entry.highestBidder, entry.highestBid);
+                emit AuctionFailed(id, entry.highestBidder, entry.highestBid);
+                return;
+            }
+            fee = uint256(entry.highestBid) * entry.feeBps / BPS;
+            address recipient = marketplace.treasury();
+            if (recipient == address(0)) revert DomixValidation.ZeroAddress();
+            _pushOrCredit(entry.seller, uint256(entry.highestBid) - fee);
+            if (fee != 0) _pushOrCredit(recipient, fee);
+            try marketplace.recordExternalSale(entry.collection, entry.tokenId, entry.highestBid, fee) {}
+            catch { emit SaleAccountingFailed(id); }
+        } else {
+            if (!_deliver(entry.collection, entry.seller, entry.tokenId)) {
+                entry.status = uint8(Status.Failed);
+                emit AuctionFailed(id, address(0), 0);
+                return;
+            }
+        }
+        emit AuctionSettled(id, entry.seller, entry.highestBidder, entry.highestBid, fee);
+    }
+
+    /// @notice Only the seller may cancel, only before any bids; pause never blocks this exit.
+    /// @dev Safely delivers to nonzero `to`; failure reverts so the seller can retry another recipient.
+    function cancelAuction(uint256 id, address to) external nonReentrant {
+        Auction storage entry = _active(id);
+        if (entry.seller != msg.sender) revert NotSeller();
+        if (entry.highestBidder != address(0)) revert HasBids();
+        if (to == address(0)) revert DomixValidation.ZeroAddress();
+        entry.status = uint8(Status.Cancelled);
+        if (!_deliver(entry.collection, to, entry.tokenId)) revert UnexpectedNFT();
+        emit AuctionCancelled(id, msg.sender);
+    }
+
+    /// @notice Seller may retrieve an NFT retained after failed settlement once, even while paused.
+    /// @dev Safely delivers to nonzero `to`; failure reverts so the seller can retry another recipient.
+    function claimUndelivered(uint256 id, address to) external nonReentrant {
+        _requireId(id);
+        Auction storage entry = _auctions[id];
+        if (entry.seller != msg.sender) revert NotSeller();
+        if (entry.status != uint8(Status.Failed) || _undeliveredClaimed[id]) revert DomixValidation.InvalidStatus();
+        if (to == address(0)) revert DomixValidation.ZeroAddress();
+        if (DomixValidation.currentOwner(entry.collection, entry.tokenId) != address(this)) revert UnexpectedNFT();
+        _undeliveredClaimed[id] = true;
+        if (!_deliver(entry.collection, to, entry.tokenId)) revert UnexpectedNFT();
+        emit UndeliveredClaimed(id, msg.sender);
+    }
+
+    /// @notice Withdraws failed bid refunds or failed settlement payouts, even while paused.
+    function withdrawRefund() external nonReentrant {
+        uint256 amount = pendingReturns[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
+        delete pendingReturns[msg.sender];
+        usdc.safeTransfer(msg.sender, amount);
+        emit RefundWithdrawn(msg.sender, amount);
+    }
+
+    /// @notice Only the exact NFT transfer initiated by createAuction is accepted.
+    /// @dev ERC-721 plain transferFrom can bypass any receiver; unsolicited plain transfers are not rescuable.
+    function onERC721Received(address operator, address from, uint256 tokenId, bytes calldata)
+        external view override returns (bytes4)
+    {
+        Auction storage entry = _auctions[_receivingId];
+        if (!_receiving || msg.sender != entry.collection || operator != address(this)
+            || from != entry.seller || tokenId != entry.tokenId) revert UnexpectedNFT();
+        return IERC721Receiver.onERC721Received.selector;
+    }
+
+    /// @notice Returns auction data with its endTime and hard-end cap.
+    function getAuction(uint256 id) external view returns (Auction memory entry) {
+        _requireId(id);
+        entry = _auctions[id];
+    }
+
+    function minNextBid(uint256 id) external view returns (uint256) {
+        _requireId(id);
+        return _minimum(_auctions[id]);
+    }
+
+    function _minimum(Auction storage entry) private view returns (uint256) {
+        return entry.highestBidder == address(0)
+            ? uint256(entry.startPrice) : uint256(entry.highestBid) + entry.minIncrement;
+    }
+
+    function _requireId(uint256 id) private view {
+        if (id == 0 || id >= nextAuctionId) revert DomixValidation.InvalidId();
+    }
+
+    function _active(uint256 id) private view returns (Auction storage entry) {
+        _requireId(id);
+        entry = _auctions[id];
+        if (entry.status != uint8(Status.Active)) revert DomixValidation.InvalidStatus();
+    }
+
+    /// @dev Uses only safe transfer; receiver-hook or registrar refusal returns false.
+    function _deliver(address collection, address to, uint256 tokenId) private returns (bool) {
+        try IERC721(collection).safeTransferFrom(address(this), to, tokenId) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /// @dev Bounded gas prevents a failing payout from consuming the whole bid/settlement transaction.
+    ///      False/reverting USDC transfers must not have moved funds, as for standard USDC.
+    function _pushOrCredit(address recipient, uint256 amount) private {
+        bool paid;
+        try usdc.transfer{gas: 80_000}(recipient, amount) returns (bool ok) { paid = ok; }
+        catch { paid = false; }
+        if (paid) {
+            emit PaymentSent(recipient, amount);
+        } else {
+            pendingReturns[recipient] += amount;
+            emit RefundCredited(recipient, amount);
+        }
+    }
+}

@@ -1,0 +1,345 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {DomixTestBase} from "./DomixBase.t.sol";
+import "./DomixImports.sol";
+
+contract DomixMarketplaceBuyTest is DomixTestBase {
+    uint256 internal id;
+    uint256 internal constant PRICE = 1_000 * ONE;
+
+    function setUp() public override {
+        super.setUp();
+        id = _listed("alice", PRICE);
+    }
+
+    // ---- buy: atomic settlement ---------------------------------------
+    function test_Buy_SettlesAtomicallyWithExactFeeMath() public {
+        uint256 fee = PRICE * 250 / 10_000; // 25 USDC
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        uint256 treasBefore = usdc.balanceOf(treasury);
+
+        vm.expectEmit(true, true, true, true, address(market));
+        emit DomixMarketplace.Sold(address(reg), id, alice, bob, PRICE, fee);
+        vm.prank(bob);
+        market.buy(address(reg), id, PRICE);
+
+        assertEq(reg.ownerOf(id), bob);
+        assertEq(usdc.balanceOf(alice), aliceBefore + PRICE - fee);
+        assertEq(usdc.balanceOf(treasury), treasBefore + fee);
+        assertEq(usdc.balanceOf(bob), bobBefore - PRICE);
+        assertEq(usdc.balanceOf(address(market)), 0, "marketplace holds no funds");
+        assertEq(market.getListing(address(reg), id).seller, address(0));
+        assertEq(market.salesCount(), 1);
+        assertEq(market.totalVolume(), PRICE);
+        assertEq(market.totalFees(), fee);
+        assertEq(fee, 25 * ONE);
+    }
+
+    function test_Buy_ZeroFeeSkipsTreasuryTransfer() public {
+        vm.prank(owner);
+        market.setFee(0);
+        uint256 treasBefore = usdc.balanceOf(treasury);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(bob);
+        market.buy(address(reg), id, PRICE);
+        assertEq(usdc.balanceOf(treasury), treasBefore);
+        assertEq(usdc.balanceOf(alice), aliceBefore + PRICE);
+    }
+
+    function test_Buy_MaxFeeTenPercent() public {
+        vm.prank(owner);
+        market.setFee(1000);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 treasBefore = usdc.balanceOf(treasury);
+        vm.prank(bob);
+        market.buy(address(reg), id, PRICE);
+        assertEq(usdc.balanceOf(treasury) - treasBefore, 100 * ONE);
+        assertEq(usdc.balanceOf(alice) - aliceBefore, 900 * ONE);
+    }
+
+    function test_Buy_UsesFeeAtTimeOfPurchase() public {
+        vm.prank(owner);
+        market.setFee(500);
+        uint256 treasBefore = usdc.balanceOf(treasury);
+        vm.prank(bob);
+        market.buy(address(reg), id, PRICE);
+        assertEq(usdc.balanceOf(treasury) - treasBefore, 50 * ONE);
+    }
+
+    function test_Buy_MaxPriceSlippageGuard() public {
+        vm.prank(alice);
+        market.updateListing(address(reg), id, PRICE + 1, 7 days);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(IDomixMarketplace.PriceAboveMaximum.selector, PRICE + 1, PRICE));
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_RevertsMissingListing() public {
+        vm.prank(bob);
+        vm.expectRevert(DomixMarketplace.MissingListing.selector);
+        market.buy(address(reg), _id("nothing"), PRICE);
+    }
+
+    function test_Buy_RevertsSelfTrade() public {
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.SelfTrade.selector);
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_RevertsExpiredListing() public {
+        skip(7 days);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_RevertsWhenSellerTransferredAway() public {
+        vm.prank(alice);
+        reg.transferFrom(alice, carol, id);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_RevertsWhenApprovalRevoked() public {
+        _approveNFT(reg, alice, address(0), id);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_RevertsWhenCollectionDelisted() public {
+        vm.prank(owner);
+        market.setCollection(address(reg), false, true);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_RevertsWhenNameExpiryEntersBuffer() public {
+        reg.setExpiry(id, block.timestamp + 7 days + 7 days); // == listing expiry + buffer
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_RevertsWhenNameFullyExpired() public {
+        reg.expire(id);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_RevertsWhenPaused() public {
+        vm.prank(owner);
+        market.pause();
+        vm.prank(bob);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_ResumesAfterUnpause() public {
+        vm.startPrank(owner);
+        market.pause();
+        market.unpause();
+        vm.stopPrank();
+        vm.prank(bob);
+        market.buy(address(reg), id, PRICE);
+        assertEq(reg.ownerOf(id), bob);
+    }
+
+    function test_Buy_InsufficientAllowanceRevertsAndLeavesListing() public {
+        vm.prank(bob);
+        usdc.approve(address(market), PRICE - 1);
+        vm.prank(bob);
+        vm.expectRevert();
+        market.buy(address(reg), id, PRICE);
+        assertEq(reg.ownerOf(id), alice);
+        assertEq(market.getListing(address(reg), id).seller, alice);
+        assertEq(market.salesCount(), 0);
+    }
+
+    function test_Buy_InsufficientBalanceRevertsAtomically() public {
+        address poor = makeAddr("poor");
+        vm.startPrank(poor);
+        usdc.approve(address(market), type(uint256).max);
+        vm.expectRevert();
+        market.buy(address(reg), id, PRICE);
+        vm.stopPrank();
+        assertEq(reg.ownerOf(id), alice);
+        assertEq(usdc.balanceOf(treasury), 0);
+    }
+
+    function test_Buy_BlacklistedSellerRevertsWholeSale() public {
+        usdc.setBlacklisted(alice, true);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob);
+        vm.expectRevert();
+        market.buy(address(reg), id, PRICE);
+        assertEq(usdc.balanceOf(bob), bobBefore);
+        assertEq(reg.ownerOf(id), alice);
+        assertEq(market.getListing(address(reg), id).seller, alice);
+    }
+
+    function test_Buy_BlacklistedTreasuryRevertsWholeSale() public {
+        usdc.setBlacklisted(treasury, true);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(bob);
+        vm.expectRevert();
+        market.buy(address(reg), id, PRICE);
+        assertEq(usdc.balanceOf(alice), aliceBefore);
+        assertEq(reg.ownerOf(id), alice);
+    }
+
+    function test_Buy_RegistrarRejectingExpiredTransferReverts() public {
+        // collection without expiry policy: listing is "valid", but registrar refuses the transfer
+        uint256 pid = plainReg.register("plain", alice, block.timestamp - 1); // already expired
+        _approveNFT(plainReg, alice, address(market), pid);
+        vm.prank(alice);
+        market.list(address(plainReg), pid, PRICE, 1 days);
+        plainReg.setRejectTransfersWhenExpired(true);
+        assertTrue(market.isListingValid(address(plainReg), pid));
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob);
+        vm.expectRevert();
+        market.buy(address(plainReg), pid, PRICE);
+        assertEq(usdc.balanceOf(bob), bobBefore, "payment rolled back");
+        assertEq(usdc.balanceOf(alice), 1_000_000 * ONE);
+        assertEq(plainReg.ownerOf(pid), alice);
+    }
+
+    function test_Buy_ContractBuyerRejectingERC721RevertsAtomically() public {
+        ContractBidder buyer = _newBidder();
+        buyer.approveToken(IERC20(address(usdc)), address(market), type(uint256).max);
+        uint256 before_ = usdc.balanceOf(address(buyer));
+        vm.expectRevert();
+        buyer.exec(address(market), abi.encodeCall(market.buy, (address(reg), id, PRICE)));
+        assertEq(usdc.balanceOf(address(buyer)), before_);
+        assertEq(reg.ownerOf(id), alice);
+        assertEq(market.getListing(address(reg), id).seller, alice);
+    }
+
+    function test_Buy_ReentrancyFromReceiverHookIsBlocked() public {
+        uint256 id2 = _listed("second", PRICE);
+        ContractBidder buyer = _newBidder();
+        buyer.setAccept(true);
+        buyer.approveToken(IERC20(address(usdc)), address(market), type(uint256).max);
+        buyer.setHook(address(market), abi.encodeCall(market.buy, (address(reg), id2, PRICE)));
+        buyer.exec(address(market), abi.encodeCall(market.buy, (address(reg), id, PRICE)));
+        assertTrue(buyer.hookCalled());
+        assertFalse(buyer.hookCallSucceeded(), "re-entrant buy must fail");
+        assertEq(reg.ownerOf(id), address(buyer));
+        assertEq(reg.ownerOf(id2), alice);
+    }
+
+    function test_Buy_CannotBuyTwice() public {
+        vm.prank(bob);
+        market.buy(address(reg), id, PRICE);
+        vm.prank(carol);
+        vm.expectRevert(DomixMarketplace.MissingListing.selector);
+        market.buy(address(reg), id, PRICE);
+    }
+
+    function test_Buy_NewOwnerCanRelist() public {
+        vm.prank(bob);
+        market.buy(address(reg), id, PRICE);
+        _approveNFT(reg, bob, address(market), id);
+        _list(bob, id, PRICE * 2, 1 days);
+        vm.prank(carol);
+        market.buy(address(reg), id, PRICE * 2);
+        assertEq(reg.ownerOf(id), carol);
+        assertEq(market.salesCount(), 2);
+    }
+
+    // ---- recordExternalSale -------------------------------------------
+    function test_RecordExternalSale_OnlySettler() public {
+        vm.prank(stranger);
+        vm.expectRevert(DomixMarketplace.NotSettler.selector);
+        market.recordExternalSale(address(reg), id, PRICE, 0);
+        vm.prank(owner);
+        vm.expectRevert(DomixMarketplace.NotSettler.selector);
+        market.recordExternalSale(address(reg), id, PRICE, 0);
+    }
+
+    function test_RecordExternalSale_UpdatesStatsClearsListingAndEmits() public {
+        vm.expectEmit(true, true, true, true, address(market));
+        emit DomixMarketplace.ListingCancelled(address(reg), id, alice);
+        vm.expectEmit(true, true, true, true, address(market));
+        emit DomixMarketplace.ExternalSaleRecorded(address(reg), id, address(auction), PRICE, 10 * ONE);
+        vm.prank(address(auction));
+        market.recordExternalSale(address(reg), id, PRICE, 10 * ONE);
+        assertEq(market.getListing(address(reg), id).seller, address(0));
+        assertEq(market.salesCount(), 1);
+        assertEq(market.totalVolume(), PRICE);
+        assertEq(market.totalFees(), 10 * ONE);
+    }
+
+    function test_RecordExternalSale_FeeCapTenPercent() public {
+        vm.startPrank(address(offers));
+        market.recordExternalSale(address(reg), id, PRICE, PRICE / 10);
+        vm.expectRevert(DomixValidation.InvalidFee.selector);
+        market.recordExternalSale(address(reg), id, PRICE, PRICE / 10 + 1);
+        vm.stopPrank();
+    }
+
+    function test_RecordExternalSale_ValidatesPriceAndCollection() public {
+        vm.startPrank(address(offers));
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, 5, 10_000, type(uint128).max));
+        market.recordExternalSale(address(reg), id, 5, 0);
+        vm.expectRevert(DomixValidation.NotContract.selector);
+        market.recordExternalSale(alice, id, PRICE, 0);
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        market.recordExternalSale(address(0), id, PRICE, 0);
+        vm.stopPrank();
+    }
+
+    function test_RecordExternalSale_WorksWhilePaused() public {
+        vm.prank(owner);
+        market.pause();
+        vm.prank(address(offers));
+        market.recordExternalSale(address(reg), id, PRICE, 0);
+        assertEq(market.salesCount(), 1);
+    }
+
+    function test_RecordExternalSale_RevokedSettlerRejected() public {
+        vm.prank(owner);
+        market.setSettler(address(offers), false);
+        vm.prank(address(offers));
+        vm.expectRevert(DomixMarketplace.NotSettler.selector);
+        market.recordExternalSale(address(reg), id, PRICE, 0);
+    }
+
+    // ---- fuzz ----------------------------------------------------------
+    function testFuzz_Buy_ExactFeeSplit(uint256 price, uint16 bps) public {
+        price = bound(price, 10_000, 500_000 * ONE);
+        bps = uint16(bound(bps, 0, 1000));
+        vm.prank(owner);
+        market.setFee(bps);
+        vm.prank(alice);
+        market.updateListing(address(reg), id, price, 7 days);
+
+        uint256 fee = price * bps / 10_000;
+        uint256 a0 = usdc.balanceOf(alice);
+        uint256 t0 = usdc.balanceOf(treasury);
+        uint256 b0 = usdc.balanceOf(bob);
+        vm.prank(bob);
+        market.buy(address(reg), id, price);
+
+        assertEq(usdc.balanceOf(alice) - a0, price - fee);
+        assertEq(usdc.balanceOf(treasury) - t0, fee);
+        assertEq(b0 - usdc.balanceOf(bob), price);
+        assertEq(usdc.balanceOf(address(market)), 0);
+        assertEq(market.totalFees(), fee);
+        assertEq(market.totalVolume(), price);
+    }
+
+    function testFuzz_RecordExternalSale_FeeCap(uint256 price, uint256 fee) public {
+        price = bound(price, 10_000, type(uint128).max);
+        fee = bound(fee, 0, price);
+        vm.prank(address(auction));
+        if (fee > price * 1000 / 10_000) vm.expectRevert(DomixValidation.InvalidFee.selector);
+        market.recordExternalSale(address(reg), id, price, fee);
+    }
+}

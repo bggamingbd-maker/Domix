@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {DomixTestBase} from "./DomixBase.t.sol";
+import "./DomixImports.sol";
+
+contract DomixMarketplaceListingTest is DomixTestBase {
+    uint256 internal id;
+
+    function setUp() public override {
+        super.setUp();
+        id = _mint(reg, "alice", alice);
+        _approveNFT(reg, alice, address(market), id);
+    }
+
+    // ---- list ----------------------------------------------------------
+    function test_List_StoresListingAndEmits() public {
+        uint64 expiry = uint64(block.timestamp + 3 days);
+        vm.expectEmit(true, true, true, true, address(market));
+        emit DomixMarketplace.Listed(address(reg), id, alice, 100 * ONE, expiry);
+        _list(alice, id, 100 * ONE, 3 days);
+
+        DomixMarketplace.Listing memory l = market.getListing(address(reg), id);
+        assertEq(l.seller, alice);
+        assertEq(l.price, 100 * ONE);
+        assertEq(l.expiresAt, expiry);
+        assertTrue(market.isListingValid(address(reg), id));
+        // non-custodial
+        assertEq(reg.ownerOf(id), alice);
+    }
+
+    function test_List_WorksWithApprovalForAll() public {
+        uint256 id2 = _mint(reg, "second", alice);
+        vm.prank(alice);
+        reg.setApprovalForAll(address(market), true);
+        _list(alice, id2, 50 * ONE, 1 days);
+        assertTrue(market.isListingValid(address(reg), id2));
+    }
+
+    function test_List_PlainCollectionNeedsNoExpiry() public {
+        uint256 pid = plainReg.register("p", alice, 0); // expiry 0 is ignored when !hasExpiry
+        _approveNFT(plainReg, alice, address(market), pid);
+        vm.prank(alice);
+        market.list(address(plainReg), pid, 20 * ONE, 1 days);
+        assertTrue(market.isListingValid(address(plainReg), pid));
+    }
+
+    function test_List_RevertsCollectionNotAllowed() public {
+        uint256 oid = _mint(otherReg, "o", alice);
+        _approveNFT(otherReg, alice, address(market), oid);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.CollectionNotAllowed.selector);
+        market.list(address(otherReg), oid, 20 * ONE, 1 days);
+    }
+
+    function test_List_RevertsPriceBounds() public {
+        vm.startPrank(alice);
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, 9_999, 10_000, type(uint128).max));
+        market.list(address(reg), id, 9_999, 1 days);
+        uint256 big = uint256(type(uint128).max) + 1;
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, big, 10_000, type(uint128).max));
+        market.list(address(reg), id, big, 1 days);
+        vm.stopPrank();
+        // boundary min is OK
+        _list(alice, id, 10_000, 1 days);
+    }
+
+    function test_List_RevertsDurationBounds() public {
+        vm.startPrank(alice);
+        vm.expectRevert(DomixValidation.InvalidDuration.selector);
+        market.list(address(reg), id, ONE, 1 hours - 1);
+        vm.expectRevert(DomixValidation.InvalidDuration.selector);
+        market.list(address(reg), id, ONE, 365 days + 1);
+        vm.stopPrank();
+        _list(alice, id, ONE, 1 hours);
+        reg.setExpiry(id, block.timestamp + 365 days + 8 days);
+        _list(alice, id, ONE, 365 days);
+    }
+
+    function test_List_RevertsNotTokenOwner() public {
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        market.list(address(reg), id, ONE, 1 days);
+    }
+
+    function test_List_RevertsNonexistentToken() public {
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        market.list(address(reg), _id("ghost"), ONE, 1 days);
+    }
+
+    function test_List_RevertsNotApproved() public {
+        uint256 id2 = _mint(reg, "noappr", alice);
+        vm.prank(alice);
+        vm.expectRevert(DomixMarketplace.NotApproved.selector);
+        market.list(address(reg), id2, ONE, 1 days);
+    }
+
+    function test_List_RevertsWhenNameExpiresTooSoon_BufferBoundary() public {
+        uint256 id2 = _mint(reg, "short", alice);
+        _approveNFT(reg, alice, address(market), id2);
+        uint256 end = block.timestamp + 2 days;
+        // needs nameExpires > listingExpiry + buffer; equal must fail
+        reg.setExpiry(id2, end + 7 days);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidExpiry.selector);
+        market.list(address(reg), id2, ONE, 2 days);
+        reg.setExpiry(id2, end + 7 days + 1);
+        _list(alice, id2, ONE, 2 days);
+    }
+
+    function test_List_ExpiryBufferFollowsOwnerConfig() public {
+        uint256 id2 = _mint(reg, "buf", alice);
+        _approveNFT(reg, alice, address(market), id2);
+        reg.setExpiry(id2, block.timestamp + 2 days + 1 days);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidExpiry.selector);
+        market.list(address(reg), id2, ONE, 2 days); // default buffer 7d too large
+        vm.prank(owner);
+        market.setMinExpiryBuffer(12 hours);
+        _list(alice, id2, ONE, 2 days);
+    }
+
+    function test_List_RevertsWhenPaused() public {
+        vm.prank(owner);
+        market.pause();
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        market.list(address(reg), id, ONE, 1 days);
+    }
+
+    function test_List_OverwritesStaleListing_EmitsCancelOfOld() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        // alice transfers to bob -> alice's listing is stale
+        vm.prank(alice);
+        reg.transferFrom(alice, bob, id);
+        _approveNFT(reg, bob, address(market), id);
+
+        vm.expectEmit(true, true, true, false, address(market));
+        emit DomixMarketplace.ListingCancelled(address(reg), id, alice);
+        vm.expectEmit(true, true, true, true, address(market));
+        emit DomixMarketplace.Listed(address(reg), id, bob, 80 * ONE, uint64(block.timestamp + 1 days));
+        _list(bob, id, 80 * ONE, 1 days);
+        assertEq(market.getListing(address(reg), id).seller, bob);
+    }
+
+    // ---- updateListing -------------------------------------------------
+    function test_UpdateListing_ChangesPriceAndExpiry() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        skip(1 days);
+        uint64 expiry = uint64(block.timestamp + 10 days);
+        vm.expectEmit(true, true, true, true, address(market));
+        emit DomixMarketplace.ListingUpdated(address(reg), id, alice, 55 * ONE, expiry);
+        vm.prank(alice);
+        market.updateListing(address(reg), id, 55 * ONE, 10 days);
+        DomixMarketplace.Listing memory l = market.getListing(address(reg), id);
+        assertEq(l.price, 55 * ONE);
+        assertEq(l.expiresAt, expiry);
+    }
+
+    function test_UpdateListing_RevertsNotSeller() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        vm.prank(bob);
+        vm.expectRevert(DomixMarketplace.NotSeller.selector);
+        market.updateListing(address(reg), id, ONE, 1 days);
+    }
+
+    function test_UpdateListing_RevertsWhenNoListing() public {
+        vm.prank(alice);
+        vm.expectRevert(DomixMarketplace.NotSeller.selector);
+        market.updateListing(address(reg), id, ONE, 1 days);
+    }
+
+    function test_UpdateListing_RevertsInvalidPriceAndWhenPaused() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, 1, 10_000, type(uint128).max));
+        market.updateListing(address(reg), id, 1, 1 days);
+
+        vm.prank(owner);
+        market.pause();
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        market.updateListing(address(reg), id, ONE, 1 days);
+    }
+
+    // ---- cancelListing -------------------------------------------------
+    function test_Cancel_SellerCancels() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        vm.expectEmit(true, true, true, false, address(market));
+        emit DomixMarketplace.ListingCancelled(address(reg), id, alice);
+        vm.prank(alice);
+        market.cancelListing(address(reg), id);
+        assertEq(market.getListing(address(reg), id).seller, address(0));
+        assertFalse(market.isListingValid(address(reg), id));
+    }
+
+    function test_Cancel_RevertsMissing() public {
+        vm.prank(alice);
+        vm.expectRevert(DomixMarketplace.MissingListing.selector);
+        market.cancelListing(address(reg), id);
+    }
+
+    function test_Cancel_StrangerCannotCancelValidListing() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        vm.prank(stranger);
+        vm.expectRevert(DomixMarketplace.NotSeller.selector);
+        market.cancelListing(address(reg), id);
+    }
+
+    function test_Cancel_AnyoneCanClearExpiredListing() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        skip(3 days);
+        vm.prank(stranger);
+        market.cancelListing(address(reg), id);
+        assertEq(market.getListing(address(reg), id).seller, address(0));
+    }
+
+    function test_Cancel_AnyoneCanClearOwnershipStaleListing() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        vm.prank(alice);
+        reg.transferFrom(alice, bob, id);
+        vm.prank(stranger);
+        market.cancelListing(address(reg), id);
+        assertEq(market.getListing(address(reg), id).seller, address(0));
+    }
+
+    function test_Cancel_SellerCanCancelWhilePaused() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        vm.prank(owner);
+        market.pause();
+        vm.prank(alice);
+        market.cancelListing(address(reg), id);
+        assertEq(market.getListing(address(reg), id).seller, address(0));
+    }
+
+    function test_Cancel_StrangerCannotCancelWhilePausedIfValid() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        vm.prank(owner);
+        market.pause();
+        vm.prank(stranger);
+        vm.expectRevert(DomixMarketplace.NotSeller.selector);
+        market.cancelListing(address(reg), id);
+    }
+
+    // ---- validity / stale ---------------------------------------------
+    function test_IsListingValid_FalseWhenApprovalRevoked() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        _approveNFT(reg, alice, address(0), id);
+        assertFalse(market.isListingValid(address(reg), id));
+    }
+
+    function test_IsListingValid_FalseWhenCollectionDelisted() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        vm.prank(owner);
+        market.setCollection(address(reg), false, true);
+        assertFalse(market.isListingValid(address(reg), id));
+    }
+
+    function test_IsListingValid_FalseWhenNameExpiryWithinBuffer() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        reg.setExpiry(id, block.timestamp + 3 days + 7 days); // == threshold, not strictly after
+        assertFalse(market.isListingValid(address(reg), id));
+        reg.setExpiry(id, block.timestamp + 3 days + 7 days + 1);
+        assertTrue(market.isListingValid(address(reg), id));
+    }
+
+    function test_IsListingValid_FalseOnceExpiredByTime() public {
+        _list(alice, id, 100 * ONE, 1 days);
+        skip(1 days - 1);
+        assertTrue(market.isListingValid(address(reg), id));
+        skip(1);
+        assertFalse(market.isListingValid(address(reg), id));
+    }
+
+    function test_IsListingValid_FalseWhenRegistrarOwnerOfReverts() public {
+        _list(alice, id, 100 * ONE, 3 days);
+        reg.setOwnerOfRevertsWhenExpired(true);
+        reg.expire(id);
+        assertFalse(market.isListingValid(address(reg), id));
+    }
+
+    function test_List_ExpiredNameWhenOwnerOfRevertsIsNotOwner() public {
+        reg.setOwnerOfRevertsWhenExpired(true);
+        reg.expire(id);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        market.list(address(reg), id, ONE, 1 days);
+    }
+}

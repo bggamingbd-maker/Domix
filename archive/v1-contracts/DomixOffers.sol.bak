@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IDomixMarketplace, DomixAdmin, DomixValidation} from "./interfaces/IDomix.sol";
+
+/// @title DOMIX non-escrow domain offers
+/// @notice Offer funds remain in the offerer's wallet. Approval consents to payment only upon acceptance.
+/// @dev Balance/allowance can change after creation; acceptance then reverts atomically without a sale.
+contract DomixOffers is DomixAdmin, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    enum Status { Active, Accepted, Rejected, Cancelled }
+    struct Offer {
+        address offerer;
+        address collection;
+        uint128 price;
+        uint64 expiresAt;
+        uint8 status;
+        uint256 tokenId;
+    }
+
+    IDomixMarketplace public immutable marketplace;
+    IERC20 public immutable usdc;
+    uint256 public nextOfferId = 1;
+    mapping(uint256 => Offer) private _offers;
+
+    error MarketplacePaused();
+    error InsufficientFunds(address account, uint256 required, uint256 balance, uint256 allowance);
+    error NotOfferer();
+    event OfferMade(uint256 indexed id, address indexed offerer, address indexed collection, uint256 tokenId, uint256 price, uint64 expiresAt);
+    event OfferCancelled(uint256 indexed id, address indexed offerer);
+    event OfferRejected(uint256 indexed id, address indexed seller);
+    event OfferAccepted(uint256 indexed id, address indexed seller, address indexed offerer, uint256 price, uint256 fee);
+    event SaleAccountingFailed(uint256 indexed id);
+
+    constructor(IDomixMarketplace marketplace_, address owner_) DomixAdmin(owner_) {
+        DomixValidation.requireContract(address(marketplace_));
+        marketplace = marketplace_;
+        IERC20 token = marketplace_.usdc();
+        DomixValidation.requireContract(address(token));
+        usdc = token;
+    }
+
+    modifier whenActive() {
+        _requireNotPaused();
+        if (marketplace.paused()) revert MarketplacePaused();
+        _;
+    }
+
+    /// @notice Creates a revocable, non-funded offer for an existing token.
+    function makeOffer(address collection, uint256 tokenId, uint256 price, uint256 duration)
+        external whenActive returns (uint256 id)
+    {
+        DomixValidation.allowed(marketplace, collection);
+        DomixValidation.requirePrice(price);
+        if (duration < 1 hours || duration > 30 days) revert DomixValidation.InvalidDuration();
+        address seller = DomixValidation.currentOwner(collection, tokenId);
+        if (seller == address(0)) revert DomixValidation.NotTokenOwner();
+        if (seller == msg.sender) revert DomixValidation.SelfTrade();
+        uint256 balance = usdc.balanceOf(msg.sender);
+        uint256 allowance = usdc.allowance(msg.sender, address(this));
+        if (balance < price || allowance < price) {
+            revert InsufficientFunds(msg.sender, price, balance, allowance);
+        }
+        id = nextOfferId++;
+        uint64 expiry = uint64(block.timestamp + duration);
+        _offers[id] = Offer(msg.sender, collection, uint128(price), expiry, uint8(Status.Active), tokenId);
+        emit OfferMade(id, msg.sender, collection, tokenId, price, expiry);
+    }
+
+    /// @notice Offerer cancellation remains available while either contract is paused.
+    function cancelOffer(uint256 id) external {
+        Offer storage entry = _active(id);
+        if (entry.offerer != msg.sender) revert NotOfferer();
+        entry.status = uint8(Status.Cancelled);
+        emit OfferCancelled(id, msg.sender);
+    }
+
+    /// @notice The current token owner may reject even an expired active offer, including while paused.
+    function rejectOffer(uint256 id) external {
+        Offer storage entry = _active(id);
+        if (DomixValidation.currentOwner(entry.collection, entry.tokenId) != msg.sender) {
+            revert DomixValidation.NotTokenOwner();
+        }
+        entry.status = uint8(Status.Rejected);
+        emit OfferRejected(id, msg.sender);
+    }
+
+    /// @notice Seller must approve this contract for the NFT; offerer must retain USDC balance/allowance.
+    function acceptOffer(uint256 id) external nonReentrant whenActive {
+        Offer storage stored = _active(id);
+        Offer memory entry = stored;
+        if (block.timestamp >= entry.expiresAt) revert DomixValidation.Expired();
+        bool hasExpiry = DomixValidation.allowed(marketplace, entry.collection);
+        if (DomixValidation.currentOwner(entry.collection, entry.tokenId) != msg.sender) {
+            revert DomixValidation.NotTokenOwner();
+        }
+        if (entry.offerer == msg.sender) revert DomixValidation.SelfTrade();
+        if (hasExpiry && !DomixValidation.expiryAfter(
+            entry.collection, entry.tokenId, block.timestamp + marketplace.minExpiryBuffer()
+        )) revert DomixValidation.InvalidExpiry();
+        uint16 rate = marketplace.feeBps();
+        if (rate > MAX_FEE_BPS) revert DomixValidation.InvalidFee();
+        address recipient = marketplace.treasury();
+        if (recipient == address(0)) revert DomixValidation.ZeroAddress();
+        uint256 fee = uint256(entry.price) * rate / BPS;
+        stored.status = uint8(Status.Accepted);
+        usdc.safeTransferFrom(entry.offerer, msg.sender, uint256(entry.price) - fee);
+        if (fee != 0) usdc.safeTransferFrom(entry.offerer, recipient, fee);
+        IERC721(entry.collection).safeTransferFrom(msg.sender, entry.offerer, entry.tokenId);
+        try marketplace.recordExternalSale(entry.collection, entry.tokenId, entry.price, fee) {}
+        catch { emit SaleAccountingFailed(id); }
+        emit OfferAccepted(id, msg.sender, entry.offerer, entry.price, fee);
+    }
+
+    function getOffer(uint256 id) external view returns (Offer memory) {
+        if (id == 0 || id >= nextOfferId) revert DomixValidation.InvalidId();
+        return _offers[id];
+    }
+
+    function _active(uint256 id) private view returns (Offer storage entry) {
+        if (id == 0 || id >= nextOfferId) revert DomixValidation.InvalidId();
+        entry = _offers[id];
+        if (entry.status != uint8(Status.Active)) revert DomixValidation.InvalidStatus();
+    }
+}

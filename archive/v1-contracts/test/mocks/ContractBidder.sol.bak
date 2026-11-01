@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+
+/// @notice Contract actor (bidder/offerer/seller/buyer). By default it REJECTS ERC-721 receipt.
+///         It can optionally attempt a re-entrant call from inside onERC721Received.
+contract ContractBidder is IERC721Receiver {
+    bool public acceptNFT;
+    address public hookTarget;
+    bytes public hookData;
+    bool public hookCalled;
+    bool public hookCallSucceeded;
+
+    function setAccept(bool flag) external {
+        acceptNFT = flag;
+    }
+
+    function setHook(address target, bytes calldata data) external {
+        hookTarget = target;
+        hookData = data;
+    }
+
+    function exec(address target, bytes calldata data) external returns (bytes memory ret) {
+        bool ok;
+        (ok, ret) = target.call(data);
+        if (!ok) {
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+    }
+
+    function approveToken(IERC20 token, address spender, uint256 amount) external {
+        token.approve(spender, amount);
+    }
+
+    function approveNFT(IERC721 nft, address operator, uint256 id) external {
+        nft.approve(operator, id);
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4) {
+        if (hookTarget != address(0)) {
+            hookCalled = true;
+            (bool ok,) = hookTarget.call(hookData);
+            hookCallSucceeded = ok;
+        }
+        if (!acceptNFT) revert("ContractBidder: NFT rejected");
+        return IERC721Receiver.onERC721Received.selector;
+    }
+}

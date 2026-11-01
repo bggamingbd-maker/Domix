@@ -1,0 +1,513 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {DomixAuctionTestBase} from "./DomixAuction.Base.t.sol";
+import "./DomixImports.sol";
+
+contract DomixAuctionFailureTest is DomixAuctionTestBase {
+    // ---- cancelAuction(id, to) ----------------------------------------
+    function test_Cancel_SellerReturnsNFTToChosenRecipient() public {
+        vm.expectEmit(true, true, false, false, address(auction));
+        emit DomixAuction.AuctionCancelled(aid, alice);
+        vm.prank(alice);
+        auction.cancelAuction(aid, carol);
+        assertEq(reg.ownerOf(tokenId), carol);
+        assertEq(_auction(aid).status, 2);
+    }
+
+    function test_Cancel_ToSellerItself() public {
+        vm.prank(alice);
+        auction.cancelAuction(aid, alice);
+        assertEq(reg.ownerOf(tokenId), alice);
+    }
+
+    function test_Cancel_RevertsForNonSeller() public {
+        vm.prank(bob);
+        vm.expectRevert(DomixAuction.NotSeller.selector);
+        auction.cancelAuction(aid, bob);
+    }
+
+    function test_Cancel_RevertsWithBids() public {
+        _bid(bob, START);
+        vm.prank(alice);
+        vm.expectRevert(DomixAuction.HasBids.selector);
+        auction.cancelAuction(aid, alice);
+    }
+
+    function test_Cancel_RevertsZeroRecipient() public {
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        auction.cancelAuction(aid, address(0));
+    }
+
+    function test_Cancel_RevertsOnInvalidIdOrNonActive() public {
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        auction.cancelAuction(9, alice);
+        vm.prank(alice);
+        auction.cancelAuction(aid, alice);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        auction.cancelAuction(aid, alice);
+    }
+
+    function test_Cancel_RejectingRecipientRevertsAndAllowsRetry() public {
+        ContractBidder rejecter = new ContractBidder();
+        vm.prank(alice);
+        vm.expectRevert(DomixAuction.UnexpectedNFT.selector);
+        auction.cancelAuction(aid, address(rejecter));
+        // state fully rolled back: still Active, NFT still escrowed
+        assertEq(_auction(aid).status, 0);
+        assertEq(reg.ownerOf(tokenId), address(auction));
+        vm.prank(alice);
+        auction.cancelAuction(aid, bob);
+        assertEq(reg.ownerOf(tokenId), bob);
+    }
+
+    function test_Cancel_WorksWhilePaused() public {
+        vm.startPrank(owner);
+        auction.pause();
+        market.pause();
+        vm.stopPrank();
+        vm.prank(alice);
+        auction.cancelAuction(aid, alice);
+        assertEq(reg.ownerOf(tokenId), alice);
+    }
+
+    function test_Cancel_WorksAfterEndIfNoBids() public {
+        skip(DURATION + 1 days);
+        vm.prank(alice);
+        auction.cancelAuction(aid, alice);
+        assertEq(reg.ownerOf(tokenId), alice);
+    }
+
+    function test_Cancel_ThenBidOrSettleReverts() public {
+        vm.prank(alice);
+        auction.cancelAuction(aid, alice);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        auction.bid(aid, START);
+        skip(DURATION);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        auction.settle(aid);
+    }
+
+    function test_Cancel_ReentrancyFromRecipientHookBlocked() public {
+        ContractBidder rcpt = new ContractBidder();
+        rcpt.setAccept(true);
+        rcpt.setHook(address(auction), abi.encodeCall(auction.cancelAuction, (aid, address(rcpt))));
+        vm.prank(alice);
+        auction.cancelAuction(aid, address(rcpt));
+        assertTrue(rcpt.hookCalled());
+        assertFalse(rcpt.hookCallSucceeded());
+        assertEq(reg.ownerOf(tokenId), address(rcpt));
+    }
+
+    // ---- Failed: winner contract rejects NFT --------------------------
+    function _winnerRejects() internal returns (ContractBidder cb) {
+        cb = _newBidder();
+        _contractBid(cb, 200 * ONE);
+        skip(DURATION);
+    }
+
+    function test_Failed_RejectingWinner_RefundedAndNFTRetained() public {
+        ContractBidder cb = _winnerRejects();
+        uint256 before_ = usdc.balanceOf(address(cb));
+        vm.expectEmit(true, true, false, true, address(auction));
+        emit DomixAuction.AuctionFailed(aid, address(cb), 200 * ONE);
+        auction.settle(aid);
+
+        assertEq(_auction(aid).status, 3);
+        assertEq(usdc.balanceOf(address(cb)), before_ + 200 * ONE, "full bid refunded");
+        assertEq(usdc.balanceOf(address(auction)), 0);
+        assertEq(usdc.balanceOf(treasury), 0, "no fee on failed sale");
+        assertEq(reg.ownerOf(tokenId), address(auction), "NFT retained in escrow");
+        assertEq(market.salesCount(), 0, "no sale accounted");
+    }
+
+    function test_Failed_ClaimUndelivered_SellerRetrievesToRecipient() public {
+        _winnerRejects();
+        auction.settle(aid);
+        vm.expectEmit(true, true, false, false, address(auction));
+        emit DomixAuction.UndeliveredClaimed(aid, alice);
+        vm.prank(alice);
+        auction.claimUndelivered(aid, carol);
+        assertEq(reg.ownerOf(tokenId), carol);
+    }
+
+    function test_Failed_ClaimUndelivered_OnlyOnce() public {
+        _winnerRejects();
+        auction.settle(aid);
+        vm.prank(alice);
+        auction.claimUndelivered(aid, alice);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        auction.claimUndelivered(aid, alice);
+    }
+
+    function test_Failed_ClaimUndelivered_Guards() public {
+        _winnerRejects();
+        auction.settle(aid);
+        vm.prank(bob);
+        vm.expectRevert(DomixAuction.NotSeller.selector);
+        auction.claimUndelivered(aid, bob);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        auction.claimUndelivered(aid, address(0));
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        auction.claimUndelivered(0, alice);
+    }
+
+    function test_Failed_ClaimUndelivered_RevertsIfNotFailed() public {
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector); // Active
+        auction.claimUndelivered(aid, alice);
+        skip(DURATION);
+        auction.settle(aid); // Settled (no bids)
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        auction.claimUndelivered(aid, alice);
+    }
+
+    function test_Failed_ClaimUndelivered_RejectingRecipientRetryable() public {
+        _winnerRejects();
+        auction.settle(aid);
+        ContractBidder rejecter = new ContractBidder();
+        vm.prank(alice);
+        vm.expectRevert(DomixAuction.UnexpectedNFT.selector);
+        auction.claimUndelivered(aid, address(rejecter));
+        vm.prank(alice);
+        auction.claimUndelivered(aid, bob); // flag was rolled back
+        assertEq(reg.ownerOf(tokenId), bob);
+    }
+
+    function test_Failed_ClaimUndelivered_WorksWhilePaused() public {
+        _winnerRejects();
+        auction.settle(aid);
+        vm.startPrank(owner);
+        auction.pause();
+        market.pause();
+        vm.stopPrank();
+        vm.prank(alice);
+        auction.claimUndelivered(aid, alice);
+        assertEq(reg.ownerOf(tokenId), alice);
+    }
+
+    function test_Failed_ClaimUndelivered_ReentrancyBlocked() public {
+        _winnerRejects();
+        auction.settle(aid);
+        ContractBidder rcpt = new ContractBidder();
+        rcpt.setAccept(true);
+        rcpt.setHook(address(auction), abi.encodeCall(auction.claimUndelivered, (aid, address(rcpt))));
+        vm.prank(alice);
+        auction.claimUndelivered(aid, address(rcpt));
+        assertFalse(rcpt.hookCallSucceeded());
+        assertEq(reg.ownerOf(tokenId), address(rcpt));
+    }
+
+    // ---- Failed: name expired before settlement -----------------------
+    function _bidThenNameExpires() internal {
+        _bid(bob, 150 * ONE);
+        skip(DURATION);
+        reg.setExpiry(tokenId, block.timestamp); // expired at settlement time
+    }
+
+    function test_Failed_ExpiredName_BidderRefundedAuctionFails() public {
+        _bidThenNameExpires();
+        uint256 b0 = usdc.balanceOf(bob);
+        auction.settle(aid);
+        assertEq(_auction(aid).status, 3);
+        assertEq(usdc.balanceOf(bob), b0 + 150 * ONE);
+        assertEq(usdc.balanceOf(address(auction)), 0);
+        assertEq(reg.ownerOf(tokenId), address(auction));
+        assertEq(market.salesCount(), 0);
+    }
+
+    function test_Failed_ExpiredName_SellerCanClaimWhenRegistrarAllowsTransfer() public {
+        _bidThenNameExpires();
+        auction.settle(aid);
+        vm.prank(alice);
+        auction.claimUndelivered(aid, alice);
+        assertEq(reg.ownerOf(tokenId), alice);
+    }
+
+    function test_Failed_ExpiredName_ClaimRevertsWhenRegistrarRejectsExpiredTransfers_ThenSucceedsAfterRenewal() public {
+        _bidThenNameExpires();
+        reg.setRejectTransfersWhenExpired(true);
+        auction.settle(aid); // delivery would also fail; refund path
+        assertEq(_auction(aid).status, 3);
+
+        vm.prank(alice);
+        vm.expectRevert(DomixAuction.UnexpectedNFT.selector);
+        auction.claimUndelivered(aid, alice);
+
+        reg.setExpiry(tokenId, block.timestamp + 365 days); // renewal
+        vm.prank(alice);
+        auction.claimUndelivered(aid, alice);
+        assertEq(reg.ownerOf(tokenId), alice);
+    }
+
+    function test_Failed_ExpiredName_ClaimRevertsWhileOwnerOfRevertsForExpired() public {
+        _bidThenNameExpires();
+        reg.setOwnerOfRevertsWhenExpired(true);
+        auction.settle(aid);
+        assertEq(_auction(aid).status, 3);
+        vm.prank(alice);
+        vm.expectRevert(DomixAuction.UnexpectedNFT.selector);
+        auction.claimUndelivered(aid, alice);
+    }
+
+    function test_Failed_RegistrarRejectingExpiredTransfer_PlainCollectionWinnerRefunded() public {
+        // collection without expiry policy; registrar itself refuses transfers once expired
+        uint256 pid = plainReg.register("p", alice, block.timestamp + 10 days);
+        _approveNFT(plainReg, alice, address(auction), pid);
+        vm.prank(alice);
+        uint256 id2 = auction.createAuction(address(plainReg), pid, START, INC, 1 days);
+        vm.prank(bob);
+        auction.bid(id2, START);
+        skip(1 days);
+        plainReg.setExpiry(pid, block.timestamp);
+        plainReg.setRejectTransfersWhenExpired(true);
+        uint256 b0 = usdc.balanceOf(bob);
+        auction.settle(id2);
+        assertEq(_auction(id2).status, 3);
+        assertEq(usdc.balanceOf(bob), b0 + START);
+    }
+
+    // ---- Failed: no-bid + seller can't receive ------------------------
+    function _contractSellerAuction() internal returns (ContractBidder s, uint256 id2) {
+        s = new ContractBidder(); // rejects ERC-721 receipt
+        uint256 sid = _mint(reg, "contractseller", address(s));
+        s.exec(address(reg), abi.encodeCall(reg.approve, (address(auction), sid)));
+        bytes memory ret = s.exec(
+            address(auction), abi.encodeCall(auction.createAuction, (address(reg), sid, START, INC, 1 days))
+        );
+        id2 = abi.decode(ret, (uint256));
+        tokenId = sid;
+    }
+
+    function test_Failed_NoBid_SellerContractRejects_ClaimToOtherRecipient() public {
+        (ContractBidder s, uint256 id2) = _contractSellerAuction();
+        skip(1 days);
+        vm.expectEmit(true, true, false, true, address(auction));
+        emit DomixAuction.AuctionFailed(id2, address(0), 0);
+        auction.settle(id2);
+        assertEq(_auction(id2).status, 3);
+        assertEq(reg.ownerOf(tokenId), address(auction));
+
+        s.exec(address(auction), abi.encodeCall(auction.claimUndelivered, (id2, carol)));
+        assertEq(reg.ownerOf(tokenId), carol);
+    }
+
+    function test_Failed_NoBid_ClaimToSelfStillRejectedThenSucceedsElsewhere() public {
+        (ContractBidder s, uint256 id2) = _contractSellerAuction();
+        skip(1 days);
+        auction.settle(id2);
+        vm.expectRevert(DomixAuction.UnexpectedNFT.selector);
+        s.exec(address(auction), abi.encodeCall(auction.claimUndelivered, (id2, address(s))));
+        s.exec(address(auction), abi.encodeCall(auction.claimUndelivered, (id2, alice)));
+        assertEq(reg.ownerOf(tokenId), alice);
+    }
+
+    function test_Failed_NoBid_ExpiredNameRejectingTransfers() public {
+        reg.setRejectTransfersWhenExpired(true);
+        skip(DURATION);
+        reg.setExpiry(tokenId, block.timestamp);
+        auction.settle(aid);
+        assertEq(_auction(aid).status, 3);
+        reg.setExpiry(tokenId, block.timestamp + 30 days);
+        vm.prank(alice);
+        auction.claimUndelivered(aid, alice);
+        assertEq(reg.ownerOf(tokenId), alice);
+    }
+
+    // ---- refunds: credited on failed push, withdrawRefund -------------
+    function test_Refund_OutbidBlacklistedBidderCredited_NewBidStillSucceeds() public {
+        _bid(bob, START);
+        usdc.setBlacklisted(bob, true);
+        vm.expectEmit(true, false, false, true, address(auction));
+        emit DomixAuction.RefundCredited(bob, START);
+        _bid(carol, START + INC);
+        assertEq(_auction(aid).highestBidder, carol);
+        assertEq(auction.pendingReturns(bob), START);
+        assertEq(usdc.balanceOf(address(auction)), START + INC + START);
+    }
+
+    function test_Refund_WithdrawFailsWhileBlacklistedKeepsCreditThenSucceeds() public {
+        _bid(bob, START);
+        usdc.setBlacklisted(bob, true);
+        _bid(carol, START + INC);
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(BlacklistUSDC.Blacklisted.selector, bob));
+        auction.withdrawRefund();
+        assertEq(auction.pendingReturns(bob), START, "credit preserved after failed pull");
+
+        usdc.setBlacklisted(bob, false);
+        uint256 b0 = usdc.balanceOf(bob);
+        vm.expectEmit(true, false, false, true, address(auction));
+        emit DomixAuction.RefundWithdrawn(bob, START);
+        vm.prank(bob);
+        auction.withdrawRefund();
+        assertEq(usdc.balanceOf(bob), b0 + START);
+        assertEq(auction.pendingReturns(bob), 0);
+
+        vm.prank(bob);
+        vm.expectRevert(DomixAuction.NothingToWithdraw.selector);
+        auction.withdrawRefund();
+    }
+
+    function test_Refund_GasGriefingRecipientCannotBlockBids() public {
+        _bid(bob, START);
+        usdc.setGasGrief(bob, true);
+        _bid(carol, START + INC); // push burns its 80k gas stipend, falls back to credit
+        assertEq(_auction(aid).highestBidder, carol);
+        assertEq(auction.pendingReturns(bob), START);
+    }
+
+    function test_Refund_FailedAuctionWinnerBlacklistedCreditedAndWithdrawable() public {
+        ContractBidder cb = _newBidder();
+        _contractBid(cb, 200 * ONE);
+        skip(DURATION);
+        usdc.setBlacklisted(address(cb), true);
+        auction.settle(aid);
+        assertEq(_auction(aid).status, 3);
+        assertEq(auction.pendingReturns(address(cb)), 200 * ONE);
+        assertEq(usdc.balanceOf(address(auction)), 200 * ONE);
+
+        usdc.setBlacklisted(address(cb), false);
+        cb.exec(address(auction), abi.encodeCall(auction.withdrawRefund, ()));
+        assertEq(auction.pendingReturns(address(cb)), 0);
+        assertEq(usdc.balanceOf(address(auction)), 0);
+    }
+
+    function test_Refund_WithdrawNothingReverts() public {
+        vm.prank(stranger);
+        vm.expectRevert(DomixAuction.NothingToWithdraw.selector);
+        auction.withdrawRefund();
+    }
+
+    function test_Refund_WithdrawWorksWhilePaused() public {
+        _bid(bob, START);
+        usdc.setBlacklisted(bob, true);
+        _bid(carol, START + INC);
+        usdc.setBlacklisted(bob, false);
+        vm.prank(owner);
+        auction.pause();
+        vm.prank(bob);
+        auction.withdrawRefund();
+        assertEq(auction.pendingReturns(bob), 0);
+    }
+
+    // ---- reentrancy via receiver hook ---------------------------------
+    function _assertSettleReentryBlocked(bytes memory hookData) internal {
+        ContractBidder cb = _newBidder();
+        cb.setAccept(true);
+        _contractBid(cb, 200 * ONE);
+        cb.setHook(address(auction), hookData);
+        skip(DURATION);
+        auction.settle(aid);
+        assertTrue(cb.hookCalled());
+        assertFalse(cb.hookCallSucceeded(), "re-entry must fail");
+        assertEq(_auction(aid).status, 1, "settled once");
+        assertEq(reg.ownerOf(tokenId), address(cb));
+        assertEq(usdc.balanceOf(treasury), 200 * ONE * FEE_BPS / 10_000);
+    }
+
+    function test_Reentrancy_SettleFromHookBlocked() public {
+        _assertSettleReentryBlocked(abi.encodeCall(auction.settle, (aid)));
+    }
+
+    function test_Reentrancy_WithdrawRefundFromHookBlocked() public {
+        _assertSettleReentryBlocked(abi.encodeCall(auction.withdrawRefund, ()));
+    }
+
+    function test_Reentrancy_BidFromHookBlocked() public {
+        _assertSettleReentryBlocked(abi.encodeCall(auction.bid, (aid, 300 * ONE)));
+    }
+
+    function test_Reentrancy_RejectingWinnerWithHookStillFailsCleanly() public {
+        ContractBidder cb = _newBidder();
+        _contractBid(cb, 200 * ONE); // acceptNFT == false
+        cb.setHook(address(auction), abi.encodeCall(auction.settle, (aid)));
+        skip(DURATION);
+        uint256 b0 = usdc.balanceOf(address(cb));
+        auction.settle(aid);
+        assertEq(_auction(aid).status, 3);
+        assertEq(usdc.balanceOf(address(cb)), b0 + 200 * ONE);
+    }
+
+    // ---- onERC721Received ---------------------------------------------
+    function test_OnERC721Received_RejectsUnsolicitedSafeTransfer() public {
+        uint256 id2 = _mint(reg, "gift", alice);
+        vm.prank(alice);
+        vm.expectRevert(DomixAuction.UnexpectedNFT.selector);
+        reg.safeTransferFrom(alice, address(auction), id2);
+        assertEq(reg.ownerOf(id2), alice);
+    }
+
+    function test_OnERC721Received_DirectCallReverts() public {
+        vm.expectRevert(DomixAuction.UnexpectedNFT.selector);
+        auction.onERC721Received(address(auction), alice, tokenId, "");
+    }
+
+    function test_Views_InvalidIdsRevert() public {
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        auction.getAuction(0);
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        auction.getAuction(5);
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        auction.minNextBid(5);
+    }
+
+    // ---- admin ---------------------------------------------------------
+    function test_Admin_PauseOwnerOnlyAndRenounceDisabled() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        auction.pause();
+        vm.prank(owner);
+        auction.pause();
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        auction.unpause();
+        vm.prank(owner);
+        auction.unpause();
+        vm.prank(owner);
+        vm.expectRevert(DomixAdmin.OwnershipRenunciationDisabled.selector);
+        auction.renounceOwnership();
+    }
+
+    // ---- fuzz: bid increments -----------------------------------------
+    function testFuzz_BidIncrement_Enforced(uint256 first, uint256 delta) public {
+        first = bound(first, START, 100_000 * ONE);
+        delta = bound(delta, 0, 2 * INC);
+        _bid(bob, first);
+        uint256 second = first + delta;
+        if (second < first + INC) {
+            vm.prank(carol);
+            vm.expectRevert(abi.encodeWithSelector(DomixAuction.BidTooLow.selector, second, first + INC));
+            auction.bid(aid, second);
+            assertEq(_auction(aid).highestBidder, bob);
+        } else {
+            uint256 b0 = usdc.balanceOf(bob);
+            _bid(carol, second);
+            assertEq(_auction(aid).highestBidder, carol);
+            assertEq(usdc.balanceOf(bob), b0 + first, "refund exact");
+            assertEq(usdc.balanceOf(address(auction)), second);
+            assertEq(auction.minNextBid(aid), second + INC);
+        }
+    }
+
+    function testFuzz_AntiSnipe_EndTimeNeverExceedsHardEnd(uint256 bidTime) public {
+        DomixAuction.Auction memory a = _auction(aid);
+        bidTime = bound(bidTime, a.endTime - 20 minutes, a.endTime - 1);
+        vm.warp(bidTime);
+        _bid(bob, START);
+        uint64 e1 = _endTime();
+        assertLe(e1, a.hardEnd);
+        assertGe(e1, a.endTime);
+        if (a.endTime - bidTime < 10 minutes) assertEq(e1, bidTime + 10 minutes);
+        else assertEq(e1, a.endTime);
+    }
+}

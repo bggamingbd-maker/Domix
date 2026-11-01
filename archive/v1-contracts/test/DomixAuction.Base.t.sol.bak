@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {DomixTestBase} from "./DomixBase.t.sol";
+import "./DomixImports.sol";
+
+abstract contract DomixAuctionTestBase is DomixTestBase {
+    uint256 internal constant START = 100 * ONE;
+    uint256 internal constant INC = 10 * ONE;
+    uint256 internal constant DURATION = 1 days;
+
+    uint256 internal tokenId; // alice's name
+    uint256 internal aid; // default auction id
+
+    function setUp() public virtual override {
+        super.setUp();
+        tokenId = _mint(reg, "alice", alice);
+        _approveNFT(reg, alice, address(auction), tokenId);
+        aid = _create();
+    }
+
+    function _create() internal returns (uint256 id_) {
+        vm.prank(alice);
+        id_ = auction.createAuction(address(reg), tokenId, START, INC, DURATION);
+    }
+
+    function _bid(address who, uint256 amount) internal {
+        vm.prank(who);
+        auction.bid(aid, amount);
+    }
+
+    function _auction(uint256 id_) internal view returns (DomixAuction.Auction memory) {
+        return auction.getAuction(id_);
+    }
+
+    function _endTime() internal view returns (uint64) {
+        return auction.getAuction(aid).endTime;
+    }
+
+    /// @dev Contract bidder with USDC approval to the auction; places a bid via exec.
+    function _contractBid(ContractBidder cb, uint256 amount) internal {
+        cb.approveToken(IERC20(address(usdc)), address(auction), type(uint256).max);
+        cb.exec(address(auction), abi.encodeCall(auction.bid, (aid, amount)));
+    }
+}

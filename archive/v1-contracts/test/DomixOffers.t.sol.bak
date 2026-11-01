@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {DomixTestBase} from "./DomixBase.t.sol";
+import "./DomixImports.sol";
+
+contract DomixOffersTest is DomixTestBase {
+    uint256 internal id;
+    uint256 internal constant PRICE = 500 * ONE;
+
+    function setUp() public override {
+        super.setUp();
+        id = _mint(reg, "alice", alice);
+        _approveNFT(reg, alice, address(offers), id);
+    }
+
+    function _offer(address from, uint256 price, uint256 duration) internal returns (uint256 oid) {
+        vm.prank(from);
+        oid = offers.makeOffer(address(reg), id, price, duration);
+    }
+
+    // ---- constructor ---------------------------------------------------
+    function test_Constructor_BindsMarketplaceAndUsdc() public view {
+        assertEq(address(offers.marketplace()), address(market));
+        assertEq(address(offers.usdc()), address(usdc));
+        assertEq(offers.nextOfferId(), 1);
+        assertEq(offers.owner(), owner);
+    }
+
+    function test_Constructor_RevertsOnNonContractMarketplace() public {
+        vm.expectRevert(DomixValidation.NotContract.selector);
+        new DomixOffers(IDomixMarketplace(alice), owner);
+    }
+
+    // ---- makeOffer -----------------------------------------------------
+    function test_MakeOffer_StoresAndEmits() public {
+        uint64 expiry = uint64(block.timestamp + 2 days);
+        vm.expectEmit(true, true, true, true, address(offers));
+        emit DomixOffers.OfferMade(1, bob, address(reg), id, PRICE, expiry);
+        uint256 oid = _offer(bob, PRICE, 2 days);
+        assertEq(oid, 1);
+        DomixOffers.Offer memory o = offers.getOffer(oid);
+        assertEq(o.offerer, bob);
+        assertEq(o.collection, address(reg));
+        assertEq(o.tokenId, id);
+        assertEq(o.price, PRICE);
+        assertEq(o.expiresAt, expiry);
+        assertEq(o.status, 0);
+        assertEq(offers.nextOfferId(), 2);
+        // non-escrow: bob keeps his funds
+        assertEq(usdc.balanceOf(bob), 1_000_000 * ONE);
+    }
+
+    function test_MakeOffer_MultipleOffersCoexist() public {
+        _offer(bob, PRICE, 2 days);
+        uint256 second = _offer(carol, PRICE + ONE, 2 days);
+        assertEq(second, 2);
+    }
+
+    function test_MakeOffer_RevertsCollectionNotAllowed() public {
+        uint256 oid = _mint(otherReg, "x", alice);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.CollectionNotAllowed.selector);
+        offers.makeOffer(address(otherReg), oid, PRICE, 1 days);
+    }
+
+    function test_MakeOffer_RevertsPriceAndDuration() public {
+        vm.startPrank(bob);
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, 1, 10_000, type(uint128).max));
+        offers.makeOffer(address(reg), id, 1, 1 days);
+        vm.expectRevert(DomixValidation.InvalidDuration.selector);
+        offers.makeOffer(address(reg), id, PRICE, 1 hours - 1);
+        vm.expectRevert(DomixValidation.InvalidDuration.selector);
+        offers.makeOffer(address(reg), id, PRICE, 30 days + 1);
+        offers.makeOffer(address(reg), id, PRICE, 30 days);
+        offers.makeOffer(address(reg), id, PRICE, 1 hours);
+        vm.stopPrank();
+    }
+
+    function test_MakeOffer_RevertsNonexistentToken() public {
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        offers.makeOffer(address(reg), _id("ghost"), PRICE, 1 days);
+    }
+
+    function test_MakeOffer_RevertsSelfTrade() public {
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.SelfTrade.selector);
+        offers.makeOffer(address(reg), id, PRICE, 1 days);
+    }
+
+    function test_MakeOffer_RevertsInsufficientAllowance() public {
+        vm.startPrank(bob);
+        usdc.approve(address(offers), PRICE - 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(DomixOffers.InsufficientFunds.selector, bob, PRICE, 1_000_000 * ONE, PRICE - 1)
+        );
+        offers.makeOffer(address(reg), id, PRICE, 1 days);
+        vm.stopPrank();
+    }
+
+    function test_MakeOffer_RevertsInsufficientBalance() public {
+        address poor = makeAddr("poor");
+        usdc.mint(poor, PRICE - 1);
+        vm.startPrank(poor);
+        usdc.approve(address(offers), type(uint256).max);
+        vm.expectRevert(abi.encodeWithSelector(DomixOffers.InsufficientFunds.selector, poor, PRICE, PRICE - 1, type(uint256).max));
+        offers.makeOffer(address(reg), id, PRICE, 1 days);
+        vm.stopPrank();
+    }
+
+    function test_MakeOffer_RevertsWhenOffersPaused() public {
+        vm.prank(owner);
+        offers.pause();
+        vm.prank(bob);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        offers.makeOffer(address(reg), id, PRICE, 1 days);
+    }
+
+    function test_MakeOffer_RevertsWhenMarketplacePaused() public {
+        vm.prank(owner);
+        market.pause();
+        vm.prank(bob);
+        vm.expectRevert(DomixOffers.MarketplacePaused.selector);
+        offers.makeOffer(address(reg), id, PRICE, 1 days);
+    }
+
+    // ---- cancelOffer ---------------------------------------------------
+    function test_CancelOffer_OffererCancels() public {
+        uint256 oid = _offer(bob, PRICE, 1 days);
+        vm.expectEmit(true, true, false, false, address(offers));
+        emit DomixOffers.OfferCancelled(oid, bob);
+        vm.prank(bob);
+        offers.cancelOffer(oid);
+        assertEq(offers.getOffer(oid).status, 3);
+    }
+
+    function test_CancelOffer_RevertsForNonOffererAndRepeat() public {
+        uint256 oid = _offer(bob, PRICE, 1 days);
+        vm.prank(carol);
+        vm.expectRevert(DomixOffers.NotOfferer.selector);
+        offers.cancelOffer(oid);
+        vm.prank(bob);
+        offers.cancelOffer(oid);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        offers.cancelOffer(oid);
+    }
+
+    function test_CancelOffer_InvalidIds() public {
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        offers.cancelOffer(0);
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        offers.cancelOffer(99);
+    }
+
+    function test_CancelOffer_WorksWhilePausedEitherContract() public {
+        uint256 o1 = _offer(bob, PRICE, 1 days);
+        uint256 o2 = _offer(carol, PRICE, 1 days);
+        vm.prank(owner);
+        offers.pause();
+        vm.prank(bob);
+        offers.cancelOffer(o1);
+        vm.prank(owner);
+        market.pause();
+        vm.prank(carol);
+        offers.cancelOffer(o2);
+        assertEq(offers.getOffer(o1).status, 3);
+        assertEq(offers.getOffer(o2).status, 3);
+    }
+
+    function test_CancelOffer_WorksAfterExpiry() public {
+        uint256 oid = _offer(bob, PRICE, 1 days);
+        skip(2 days);
+        vm.prank(bob);
+        offers.cancelOffer(oid);
+        assertEq(offers.getOffer(oid).status, 3);
+    }
+
+    // ---- rejectOffer ---------------------------------------------------
+    function test_RejectOffer_OwnerRejects() public {
+        uint256 oid = _offer(bob, PRICE, 1 days);
+        vm.expectEmit(true, true, false, false, address(offers));
+        emit DomixOffers.OfferRejected(oid, alice);
+        vm.prank(alice);
+        offers.rejectOffer(oid);
+        assertEq(offers.getOffer(oid).status, 2);
+    }
+
+    function test_RejectOffer_RevertsForNonOwner() public {
+        uint256 oid = _offer(bob, PRICE, 1 days);
+        vm.prank(carol);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        offers.rejectOffer(oid);
+    }
+
+    function test_RejectOffer_ExpiredAndPausedStillAllowed() public {
+        uint256 oid = _offer(bob, PRICE, 1 days);
+        skip(5 days);
+        vm.prank(owner);
+        offers.pause();
+        vm.prank(owner);
+        market.pause();
+        vm.prank(alice);
+        offers.rejectOffer(oid);
+        assertEq(offers.getOffer(oid).status, 2);
+    }
+
+    function test_RejectOffer_FollowsOwnerChange() public {
+        uint256 oid = _offer(bob, PRICE, 1 days);
+        vm.prank(alice);
+        reg.transferFrom(alice, carol, id);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        offers.rejectOffer(oid);
+        vm.prank(carol);
+        offers.rejectOffer(oid);
+    }
+
+    function test_RejectOffer_RevertsOnceNotActive() public {
+        uint256 oid = _offer(bob, PRICE, 1 days);
+        vm.prank(alice);
+        offers.rejectOffer(oid);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        offers.rejectOffer(oid);
+    }
+
+    function test_GetOffer_InvalidIdReverts() public {
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        offers.getOffer(0);
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        offers.getOffer(1);
+    }
+}

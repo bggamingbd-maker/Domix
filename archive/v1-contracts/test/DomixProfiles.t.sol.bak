@@ -1,0 +1,346 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {DomixTestBase} from "./DomixBase.t.sol";
+import "./DomixImports.sol";
+
+contract DomixProfilesTest is DomixTestBase {
+    uint256 internal id;
+
+    function setUp() public override {
+        super.setUp();
+        id = _mint(reg, "alice", alice);
+    }
+
+    function _set(address who, string memory k, string memory v) internal {
+        vm.prank(who);
+        profiles.setRecord(address(reg), id, k, v);
+    }
+
+    function _get(string memory k) internal view returns (string memory) {
+        return profiles.getRecord(address(reg), id, k);
+    }
+
+    function _rep(bytes1 c, uint256 n) internal pure returns (string memory) {
+        bytes memory b = new bytes(n);
+        for (uint256 i; i < n; ++i) b[i] = c;
+        return string(b);
+    }
+
+    // ---- constructor / constants --------------------------------------
+    function test_Constructor_BindsMarketplace() public view {
+        assertEq(address(profiles.marketplace()), address(market));
+        assertEq(profiles.MAX_KEY_BYTES(), 64);
+        assertEq(profiles.MAX_VALUE_BYTES(), 512);
+        assertEq(profiles.MAX_BATCH(), 16);
+    }
+
+    function test_Constructor_RevertsOnNonContractMarketplace() public {
+        vm.expectRevert(DomixValidation.NotContract.selector);
+        new DomixProfiles(IDomixMarketplace(alice));
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        new DomixProfiles(IDomixMarketplace(address(0)));
+    }
+
+    function test_RenounceOwnership_AlwaysReverts() public {
+        vm.expectRevert(DomixProfiles.OwnershipRenunciationDisabled.selector);
+        profiles.renounceOwnership();
+        vm.prank(alice);
+        vm.expectRevert(DomixProfiles.OwnershipRenunciationDisabled.selector);
+        profiles.renounceOwnership();
+    }
+
+    // ---- setRecord -----------------------------------------------------
+    function test_SetRecord_OwnerWritesAndEmits() public {
+        vm.expectEmit(true, true, true, true, address(profiles));
+        emit DomixProfiles.RecordSet(address(reg), id, keccak256(bytes("url")), "url", "https://alice.dom", alice);
+        _set(alice, "url", "https://alice.dom");
+        assertEq(_get("url"), "https://alice.dom");
+    }
+
+    function test_SetRecord_OverwritesExisting() public {
+        _set(alice, "display", "Alice");
+        _set(alice, "display", "Alice 2");
+        assertEq(_get("display"), "Alice 2");
+    }
+
+    function test_SetRecord_EmptyValueDeletes() public {
+        _set(alice, "display", "Alice");
+        vm.expectEmit(true, true, true, true, address(profiles));
+        emit DomixProfiles.RecordSet(address(reg), id, keccak256(bytes("display")), "display", "", alice);
+        _set(alice, "display", "");
+        assertEq(_get("display"), "");
+    }
+
+    function test_SetRecord_NonOwnerReverts() public {
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        profiles.setRecord(address(reg), id, "url", "x");
+    }
+
+    function test_SetRecord_ApprovedOperatorIsNotOwner() public {
+        _approveNFT(reg, alice, bob, id);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        profiles.setRecord(address(reg), id, "url", "x");
+    }
+
+    function test_SetRecord_NonexistentTokenReverts() public {
+        // expiring collection: unregistered name has expiry 0 -> InvalidExpiry
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidExpiry.selector);
+        profiles.setRecord(address(reg), _id("ghost"), "url", "x");
+        // non-expiring collection: no owner -> NotTokenOwner
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        profiles.setRecord(address(plainReg), _id("ghost"), "url", "x");
+    }
+
+    function test_SetRecord_UnallowedCollectionReverts() public {
+        uint256 oid = _mint(otherReg, "o", alice);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.CollectionNotAllowed.selector);
+        profiles.setRecord(address(otherReg), oid, "url", "x");
+    }
+
+    function test_SetRecord_ExpiredNameReverts() public {
+        reg.expire(id);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidExpiry.selector);
+        profiles.setRecord(address(reg), id, "url", "x");
+    }
+
+    function test_SetRecord_PlainCollectionIgnoresExpiry() public {
+        uint256 pid = plainReg.register("p", alice, 0);
+        vm.prank(alice);
+        profiles.setRecord(address(plainReg), pid, "url", "x");
+        assertEq(profiles.getRecord(address(plainReg), pid, "url"), "x");
+    }
+
+    function test_SetRecord_KeyLengthLimits() public {
+        string memory k64 = _rep("k", 64);
+        _set(alice, k64, "ok");
+        assertEq(_get(k64), "ok");
+        vm.prank(alice);
+        vm.expectRevert(DomixProfiles.InvalidKey.selector);
+        profiles.setRecord(address(reg), id, _rep("k", 65), "v");
+        vm.prank(alice);
+        vm.expectRevert(DomixProfiles.InvalidKey.selector);
+        profiles.setRecord(address(reg), id, "", "v");
+    }
+
+    function test_SetRecord_ValueLengthLimits() public {
+        string memory v512 = _rep("v", 512);
+        _set(alice, "description", v512);
+        assertEq(_get("description"), v512);
+        vm.prank(alice);
+        vm.expectRevert(DomixProfiles.InvalidValue.selector);
+        profiles.setRecord(address(reg), id, "description", _rep("v", 513));
+    }
+
+    function testFuzz_SetRecord_ValueSizeBoundary(uint256 len) public {
+        len = bound(len, 0, 700);
+        string memory v = _rep("z", len);
+        vm.prank(alice);
+        if (len > 512) {
+            vm.expectRevert(DomixProfiles.InvalidValue.selector);
+            profiles.setRecord(address(reg), id, "k", v);
+        } else {
+            profiles.setRecord(address(reg), id, "k", v);
+            assertEq(bytes(_get("k")).length, len);
+        }
+    }
+
+    function testFuzz_SetRecord_KeySizeBoundary(uint256 len) public {
+        len = bound(len, 0, 100);
+        string memory k = _rep("a", len);
+        vm.prank(alice);
+        if (len == 0 || len > 64) {
+            vm.expectRevert(DomixProfiles.InvalidKey.selector);
+            profiles.setRecord(address(reg), id, k, "v");
+        } else {
+            profiles.setRecord(address(reg), id, k, "v");
+            assertEq(_get(k), "v");
+        }
+    }
+
+    // ---- setRecords (batch) -------------------------------------------
+    function _batch(uint256 n) internal pure returns (string[] memory ks, string[] memory vs) {
+        ks = new string[](n);
+        vs = new string[](n);
+        for (uint256 i; i < n; ++i) {
+            ks[i] = string.concat("key", vm_toString(i));
+            vs[i] = string.concat("val", vm_toString(i));
+        }
+    }
+
+    function vm_toString(uint256 x) internal pure returns (string memory) {
+        if (x == 0) return "0";
+        bytes memory b;
+        while (x > 0) {
+            b = abi.encodePacked(bytes1(uint8(48 + x % 10)), b);
+            x /= 10;
+        }
+        return string(b);
+    }
+
+    function test_SetRecords_BatchOfSixteenWorks() public {
+        (string[] memory ks, string[] memory vs) = _batch(16);
+        vm.prank(alice);
+        profiles.setRecords(address(reg), id, ks, vs);
+        for (uint256 i; i < 16; ++i) assertEq(_get(ks[i]), vs[i]);
+    }
+
+    function test_SetRecords_EmitsEventPerRecord() public {
+        (string[] memory ks, string[] memory vs) = _batch(2);
+        vm.expectEmit(true, true, true, true, address(profiles));
+        emit DomixProfiles.RecordSet(address(reg), id, keccak256(bytes(ks[0])), ks[0], vs[0], alice);
+        vm.expectEmit(true, true, true, true, address(profiles));
+        emit DomixProfiles.RecordSet(address(reg), id, keccak256(bytes(ks[1])), ks[1], vs[1], alice);
+        vm.prank(alice);
+        profiles.setRecords(address(reg), id, ks, vs);
+    }
+
+    function test_SetRecords_RevertsEmptyOversizedAndMismatched() public {
+        (string[] memory k0, string[] memory v0) = _batch(0);
+        vm.prank(alice);
+        vm.expectRevert(DomixProfiles.InvalidBatch.selector);
+        profiles.setRecords(address(reg), id, k0, v0);
+
+        (string[] memory k17, string[] memory v17) = _batch(17);
+        vm.prank(alice);
+        vm.expectRevert(DomixProfiles.InvalidBatch.selector);
+        profiles.setRecords(address(reg), id, k17, v17);
+
+        (string[] memory k3,) = _batch(3);
+        (, string[] memory v2) = _batch(2);
+        vm.prank(alice);
+        vm.expectRevert(DomixProfiles.InvalidBatch.selector);
+        profiles.setRecords(address(reg), id, k3, v2);
+    }
+
+    function test_SetRecords_NonOwnerReverts() public {
+        (string[] memory ks, string[] memory vs) = _batch(2);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        profiles.setRecords(address(reg), id, ks, vs);
+    }
+
+    function test_SetRecords_AtomicOnBadEntry() public {
+        (string[] memory ks, string[] memory vs) = _batch(3);
+        vs[2] = _rep("x", 513);
+        vm.prank(alice);
+        vm.expectRevert(DomixProfiles.InvalidValue.selector);
+        profiles.setRecords(address(reg), id, ks, vs);
+        assertEq(_get(ks[0]), "", "earlier entries rolled back");
+        ks[1] = "";
+        vs[2] = "ok";
+        vm.prank(alice);
+        vm.expectRevert(DomixProfiles.InvalidKey.selector);
+        profiles.setRecords(address(reg), id, ks, vs);
+    }
+
+    function test_SetRecords_ExpiredNameAndUnallowedCollectionRevert() public {
+        (string[] memory ks, string[] memory vs) = _batch(1);
+        reg.expire(id);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidExpiry.selector);
+        profiles.setRecords(address(reg), id, ks, vs);
+        uint256 oid = _mint(otherReg, "o", alice);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.CollectionNotAllowed.selector);
+        profiles.setRecords(address(otherReg), oid, ks, vs);
+    }
+
+    // ---- getRecord visibility -----------------------------------------
+    function test_GetRecord_UnsetReturnsEmpty() public view {
+        assertEq(_get("display"), "");
+    }
+
+    function test_GetRecord_InvalidKeyReverts() public {
+        vm.expectRevert(DomixProfiles.InvalidKey.selector);
+        profiles.getRecord(address(reg), id, "");
+        string memory k65 = _rep("k", 65);
+        vm.expectRevert(DomixProfiles.InvalidKey.selector);
+        profiles.getRecord(address(reg), id, k65);
+    }
+
+    function test_GetRecord_HiddenAfterTransfer_NewOwnerStartsClean() public {
+        _set(alice, "display", "Alice");
+        vm.prank(alice);
+        reg.transferFrom(alice, bob, id);
+        assertEq(_get("display"), "", "previous owner's records hidden");
+        _set(bob, "display", "Bob");
+        assertEq(_get("display"), "Bob");
+    }
+
+    function test_GetRecord_PreviousOwnerCannotWriteAfterTransfer() public {
+        vm.prank(alice);
+        reg.transferFrom(alice, bob, id);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        profiles.setRecord(address(reg), id, "display", "still me");
+    }
+
+    function test_GetRecord_ReacquiringOwnerSeesOldRecords_DocumentedBehaviour() public {
+        _set(alice, "display", "Alice");
+        vm.prank(alice);
+        reg.transferFrom(alice, bob, id);
+        vm.prank(bob);
+        reg.transferFrom(bob, alice, id);
+        assertEq(_get("display"), "Alice");
+    }
+
+    function test_GetRecord_HiddenWhenNameExpires() public {
+        _set(alice, "display", "Alice");
+        skip(365 days);
+        assertEq(_get("display"), "");
+    }
+
+    function test_GetRecord_HiddenWhenNameExpiredViaRegistrar() public {
+        _set(alice, "display", "Alice");
+        reg.expire(id);
+        assertEq(_get("display"), "");
+        reg.setExpiry(id, block.timestamp + 30 days); // renewed
+        assertEq(_get("display"), "Alice");
+    }
+
+    function test_GetRecord_HiddenWhenOwnerOfRevertsForExpired() public {
+        _set(alice, "display", "Alice");
+        reg.setOwnerOfRevertsWhenExpired(true);
+        reg.expire(id);
+        assertEq(_get("display"), "");
+    }
+
+    function test_GetRecord_HiddenWhenCollectionDelisted() public {
+        _set(alice, "display", "Alice");
+        vm.prank(owner);
+        market.setCollection(address(reg), false, true);
+        assertEq(_get("display"), "");
+    }
+
+    function test_GetRecord_UnreadableExpiryHidesRecord() public {
+        _set(alice, "display", "Alice");
+        vm.mockCallRevert(address(reg), abi.encodeWithSignature("nameExpires(uint256)", id), "boom");
+        assertEq(_get("display"), "");
+    }
+
+    function test_GetRecord_ReclaimDoesNotChangeOwnershipVisibility() public {
+        _set(alice, "display", "Alice");
+        vm.prank(alice);
+        reg.reclaim(id, bob); // controller change only
+        assertEq(_get("display"), "Alice");
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        profiles.setRecord(address(reg), id, "display", "hijack");
+    }
+
+    function test_GetRecord_RecordsAreIsolatedPerToken() public {
+        uint256 id2 = _mint(reg, "alice2", alice);
+        _set(alice, "display", "one");
+        vm.prank(alice);
+        profiles.setRecord(address(reg), id2, "display", "two");
+        assertEq(_get("display"), "one");
+        assertEq(profiles.getRecord(address(reg), id2, "display"), "two");
+    }
+}

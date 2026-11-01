@@ -1,0 +1,237 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {DomixTestBase} from "./DomixBase.t.sol";
+import "./DomixImports.sol";
+
+contract DomixMarketplaceConfigTest is DomixTestBase {
+    // ---- constructor ---------------------------------------------------
+    function test_Constructor_SetsState() public view {
+        assertEq(address(market.usdc()), address(usdc));
+        assertEq(market.treasury(), treasury);
+        assertEq(market.feeBps(), FEE_BPS);
+        assertEq(market.owner(), owner);
+        assertEq(market.minExpiryBuffer(), 7 days);
+    }
+
+    function test_Constructor_RevertsOnEOAUsdc() public {
+        vm.expectRevert(DomixValidation.NotContract.selector);
+        new DomixMarketplace(IERC20(alice), treasury, 100, owner);
+    }
+
+    function test_Constructor_RevertsOnZeroUsdc() public {
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        new DomixMarketplace(IERC20(address(0)), treasury, 100, owner);
+    }
+
+    function test_Constructor_RevertsOnZeroTreasury() public {
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        new DomixMarketplace(IERC20(address(usdc)), address(0), 100, owner);
+    }
+
+    function test_Constructor_RevertsOnFeeAboveCap() public {
+        vm.expectRevert(DomixValidation.InvalidFee.selector);
+        new DomixMarketplace(IERC20(address(usdc)), treasury, 1001, owner);
+    }
+
+    function test_Constructor_AllowsFeeAtCap() public {
+        DomixMarketplace m = new DomixMarketplace(IERC20(address(usdc)), treasury, 1000, owner);
+        assertEq(m.feeBps(), 1000);
+    }
+
+    // ---- onlyOwner config ---------------------------------------------
+    function test_SetCollection_OwnerOnly() public {
+        vm.expectEmit(true, false, false, true, address(market));
+        emit DomixMarketplace.CollectionSet(address(otherReg), true, false);
+        vm.prank(owner);
+        market.setCollection(address(otherReg), true, false);
+        (bool a, bool e) = market.collectionInfo(address(otherReg));
+        assertTrue(a);
+        assertFalse(e);
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        market.setCollection(address(otherReg), false, false);
+    }
+
+    function test_SetCollection_RevertsOnNonContractOrZero() public {
+        vm.startPrank(owner);
+        vm.expectRevert(DomixValidation.NotContract.selector);
+        market.setCollection(alice, true, false);
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        market.setCollection(address(0), true, false);
+        vm.stopPrank();
+    }
+
+    function test_SetFee_OwnerOnlyAndCap() public {
+        vm.expectEmit(false, false, false, true, address(market));
+        emit DomixMarketplace.FeeSet(1000);
+        vm.prank(owner);
+        market.setFee(1000);
+        assertEq(market.feeBps(), 1000);
+
+        vm.prank(owner);
+        vm.expectRevert(DomixValidation.InvalidFee.selector);
+        market.setFee(1001);
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        market.setFee(1);
+    }
+
+    function test_SetTreasury_OwnerOnlyAndNonZero() public {
+        vm.expectEmit(true, false, false, false, address(market));
+        emit DomixMarketplace.TreasurySet(bob);
+        vm.prank(owner);
+        market.setTreasury(bob);
+        assertEq(market.treasury(), bob);
+
+        vm.prank(owner);
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        market.setTreasury(address(0));
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        market.setTreasury(carol);
+    }
+
+    function test_SetMinExpiryBuffer_BoundsAndOwner() public {
+        vm.prank(owner);
+        market.setMinExpiryBuffer(90 days);
+        assertEq(market.minExpiryBuffer(), 90 days);
+
+        vm.prank(owner);
+        market.setMinExpiryBuffer(0);
+        assertEq(market.minExpiryBuffer(), 0);
+
+        vm.prank(owner);
+        vm.expectRevert(DomixMarketplace.InvalidBuffer.selector);
+        market.setMinExpiryBuffer(90 days + 1);
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        market.setMinExpiryBuffer(1);
+    }
+
+    function test_SetSettler_Rules() public {
+        address c = address(new ContractBidder());
+        vm.expectEmit(true, false, false, true, address(market));
+        emit DomixMarketplace.SettlerSet(c, true);
+        vm.prank(owner);
+        market.setSettler(c, true);
+        assertTrue(market.isSettler(c));
+
+        vm.startPrank(owner);
+        vm.expectRevert(DomixValidation.NotContract.selector);
+        market.setSettler(alice, true);
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        market.setSettler(address(0), false);
+        market.setSettler(c, false);
+        vm.stopPrank();
+        assertFalse(market.isSettler(c));
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        market.setSettler(c, true);
+    }
+
+    function test_PauseUnpause_OwnerOnly() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        market.pause();
+
+        vm.prank(owner);
+        market.pause();
+        assertTrue(market.paused());
+
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        market.unpause();
+
+        vm.prank(owner);
+        market.unpause();
+        assertFalse(market.paused());
+    }
+
+    function test_RenounceOwnership_AlwaysReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(DomixAdmin.OwnershipRenunciationDisabled.selector);
+        market.renounceOwnership();
+        vm.prank(stranger);
+        vm.expectRevert(DomixAdmin.OwnershipRenunciationDisabled.selector);
+        market.renounceOwnership();
+        assertEq(market.owner(), owner);
+    }
+
+    function test_RenounceOwnership_RevertsOnOffersAndAuctionToo() public {
+        vm.expectRevert(DomixAdmin.OwnershipRenunciationDisabled.selector);
+        offers.renounceOwnership();
+        vm.expectRevert(DomixAdmin.OwnershipRenunciationDisabled.selector);
+        auction.renounceOwnership();
+    }
+
+    function test_TransferOwnership_TwoStepAndZeroReverts() public {
+        vm.prank(owner);
+        vm.expectRevert(DomixValidation.ZeroAddress.selector);
+        market.transferOwnership(address(0));
+
+        vm.prank(owner);
+        market.transferOwnership(bob);
+        assertEq(market.owner(), owner);
+        assertEq(market.pendingOwner(), bob);
+
+        vm.prank(carol);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, carol));
+        market.acceptOwnership();
+
+        vm.prank(bob);
+        market.acceptOwnership();
+        assertEq(market.owner(), bob);
+    }
+
+    function test_TransferOwnership_NonOwnerReverts() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        market.transferOwnership(stranger);
+    }
+
+    // ---- quoteFee ------------------------------------------------------
+    function test_QuoteFee_ExactMath() public view {
+        (uint256 fee, uint256 proceeds) = market.quoteFee(100 * ONE);
+        assertEq(fee, 2_500_000); // 2.5% of 100 USDC
+        assertEq(proceeds, 97_500_000);
+    }
+
+    function test_QuoteFee_RoundsDownAtMinPrice() public view {
+        (uint256 fee, uint256 proceeds) = market.quoteFee(10_000);
+        assertEq(fee, 250);
+        assertEq(proceeds, 9_750);
+    }
+
+    function test_QuoteFee_RevertsOutOfRange() public {
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, 9_999, 10_000, type(uint128).max));
+        market.quoteFee(9_999);
+        uint256 big = uint256(type(uint128).max) + 1;
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, big, 10_000, type(uint128).max));
+        market.quoteFee(big);
+    }
+
+    function testFuzz_QuoteFee_Properties(uint256 price, uint16 bps) public {
+        price = bound(price, 10_000, type(uint128).max);
+        bps = uint16(bound(bps, 0, 1000));
+        vm.prank(owner);
+        market.setFee(bps);
+        (uint256 fee, uint256 proceeds) = market.quoteFee(price);
+        assertEq(fee + proceeds, price, "conservation");
+        assertEq(fee, price * bps / 10_000, "exact floor");
+        assertLe(fee, price / 10, "fee cap 10%");
+        assertGe(proceeds, price - price / 10);
+    }
+
+    function testFuzz_SetFee_RejectsAboveCap(uint16 bps) public {
+        bps = uint16(bound(bps, 1001, type(uint16).max));
+        vm.prank(owner);
+        vm.expectRevert(DomixValidation.InvalidFee.selector);
+        market.setFee(bps);
+    }
+}

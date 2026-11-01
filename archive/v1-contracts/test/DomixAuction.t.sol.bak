@@ -1,0 +1,476 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {DomixAuctionTestBase} from "./DomixAuction.Base.t.sol";
+import "./DomixImports.sol";
+
+contract DomixAuctionTest is DomixAuctionTestBase {
+    // ---- constructor ---------------------------------------------------
+    function test_Constructor_BindsMarketplaceAndUsdc() public view {
+        assertEq(address(auction.marketplace()), address(market));
+        assertEq(address(auction.usdc()), address(usdc));
+        assertEq(auction.owner(), owner);
+    }
+
+    function test_Constructor_RevertsOnNonContractMarketplace() public {
+        vm.expectRevert(DomixValidation.NotContract.selector);
+        new DomixAuction(IDomixMarketplace(alice), owner);
+    }
+
+    // ---- createAuction -------------------------------------------------
+    function test_Create_EscrowsNFTAndStoresTerms() public {
+        assertEq(aid, 1);
+        assertEq(auction.nextAuctionId(), 2);
+        assertEq(reg.ownerOf(tokenId), address(auction));
+        DomixAuction.Auction memory a = _auction(aid);
+        assertEq(a.seller, alice);
+        assertEq(a.collection, address(reg));
+        assertEq(a.tokenId, tokenId);
+        assertEq(a.startPrice, START);
+        assertEq(a.minIncrement, INC);
+        assertEq(a.highestBid, 0);
+        assertEq(a.highestBidder, address(0));
+        assertEq(a.endTime, T0 + DURATION);
+        assertEq(a.hardEnd, T0 + DURATION + 24 hours);
+        assertEq(a.feeBps, FEE_BPS);
+        assertEq(a.status, 0);
+        assertTrue(a.hasExpiry);
+    }
+
+    function test_Create_EmitsAuctionCreated() public {
+        uint256 id2 = _mint(reg, "second", alice);
+        _approveNFT(reg, alice, address(auction), id2);
+        vm.expectEmit(true, true, true, true, address(auction));
+        emit DomixAuction.AuctionCreated(
+            2, address(reg), id2, alice, START, INC, uint64(T0 + 2 hours), uint64(T0 + 2 hours + 24 hours), FEE_BPS
+        );
+        vm.prank(alice);
+        auction.createAuction(address(reg), id2, START, INC, 2 hours);
+    }
+
+    function test_Create_PlainCollectionNoExpiryNeeded() public {
+        uint256 pid = plainReg.register("p", alice, 0);
+        _approveNFT(plainReg, alice, address(auction), pid);
+        vm.prank(alice);
+        uint256 id2 = auction.createAuction(address(plainReg), pid, START, INC, 1 days);
+        assertFalse(_auction(id2).hasExpiry);
+    }
+
+    function test_Create_RevertsCollectionNotAllowed() public {
+        uint256 oid = _mint(otherReg, "o", alice);
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.CollectionNotAllowed.selector);
+        auction.createAuction(address(otherReg), oid, START, INC, 1 days);
+    }
+
+    function test_Create_RevertsBadPricesAndDurations() public {
+        uint256 id2 = _mint(reg, "second", alice);
+        _approveNFT(reg, alice, address(auction), id2);
+        vm.startPrank(alice);
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, 1, 10_000, type(uint128).max));
+        auction.createAuction(address(reg), id2, 1, INC, 1 days);
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, 1, 10_000, type(uint128).max));
+        auction.createAuction(address(reg), id2, START, 1, 1 days);
+        vm.expectRevert(DomixValidation.InvalidDuration.selector);
+        auction.createAuction(address(reg), id2, START, INC, 1 hours - 1);
+        vm.expectRevert(DomixValidation.InvalidDuration.selector);
+        auction.createAuction(address(reg), id2, START, INC, 14 days + 1);
+        vm.stopPrank();
+    }
+
+    function test_Create_RevertsNotTokenOwner() public {
+        uint256 id2 = _mint(reg, "second", alice);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.NotTokenOwner.selector);
+        auction.createAuction(address(reg), id2, START, INC, 1 days);
+    }
+
+    function test_Create_RevertsWithoutNFTApproval() public {
+        uint256 id2 = _mint(reg, "second", alice);
+        vm.prank(alice);
+        vm.expectRevert();
+        auction.createAuction(address(reg), id2, START, INC, 1 days);
+    }
+
+    function test_Create_RevertsWhenNameExpiryCannotCoverHardEndPlusBuffer() public {
+        uint256 id2 = _mint(reg, "second", alice);
+        _approveNFT(reg, alice, address(auction), id2);
+        uint256 threshold = block.timestamp + 1 days + 24 hours + 7 days;
+        reg.setExpiry(id2, threshold); // equal, not strictly after
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.InvalidExpiry.selector);
+        auction.createAuction(address(reg), id2, START, INC, 1 days);
+        reg.setExpiry(id2, threshold + 1);
+        vm.prank(alice);
+        auction.createAuction(address(reg), id2, START, INC, 1 days);
+    }
+
+    function test_Create_RevertsWhenPaused_AuctionOwnPauseOnly() public {
+        uint256 id2 = _mint(reg, "second", alice);
+        _approveNFT(reg, alice, address(auction), id2);
+        vm.prank(owner);
+        auction.pause();
+        vm.prank(alice);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        auction.createAuction(address(reg), id2, START, INC, 1 days);
+    }
+
+    function test_Create_MarketplacePauseDoesNotBlockCreate() public {
+        uint256 id2 = _mint(reg, "second", alice);
+        _approveNFT(reg, alice, address(auction), id2);
+        vm.prank(owner);
+        market.pause();
+        vm.prank(alice);
+        auction.createAuction(address(reg), id2, START, INC, 1 days);
+    }
+
+    function test_Create_SnapshotsFeeAtCreation() public {
+        vm.prank(owner);
+        market.setFee(1000);
+        uint256 id2 = _mint(reg, "second", alice);
+        _approveNFT(reg, alice, address(auction), id2);
+        vm.prank(alice);
+        uint256 a2 = auction.createAuction(address(reg), id2, START, INC, 1 days);
+        assertEq(_auction(a2).feeBps, 1000);
+        assertEq(_auction(aid).feeBps, FEE_BPS);
+    }
+
+    // ---- bid -----------------------------------------------------------
+    function test_Bid_FirstBidAtStartPrice() public {
+        vm.expectEmit(true, true, false, true, address(auction));
+        emit DomixAuction.BidPlaced(aid, bob, START);
+        _bid(bob, START);
+        DomixAuction.Auction memory a = _auction(aid);
+        assertEq(a.highestBidder, bob);
+        assertEq(a.highestBid, START);
+        assertEq(usdc.balanceOf(address(auction)), START);
+        assertEq(auction.minNextBid(aid), START + INC);
+    }
+
+    function test_Bid_BelowStartReverts() public {
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(DomixAuction.BidTooLow.selector, START - 1, START));
+        auction.bid(aid, START - 1);
+    }
+
+    function test_Bid_BelowIncrementReverts() public {
+        _bid(bob, START);
+        vm.prank(carol);
+        vm.expectRevert(abi.encodeWithSelector(DomixAuction.BidTooLow.selector, START + INC - 1, START + INC));
+        auction.bid(aid, START + INC - 1);
+    }
+
+    function test_Bid_OutbidRefundsPreviousBidderImmediately() public {
+        uint256 b0 = usdc.balanceOf(bob);
+        _bid(bob, START);
+        vm.expectEmit(true, false, false, true, address(auction));
+        emit DomixAuction.PaymentSent(bob, START);
+        _bid(carol, START + INC);
+        assertEq(usdc.balanceOf(bob), b0, "bob fully refunded");
+        assertEq(auction.pendingReturns(bob), 0);
+        assertEq(usdc.balanceOf(address(auction)), START + INC);
+        assertEq(_auction(aid).highestBidder, carol);
+    }
+
+    function test_Bid_SelfOutbidAllowedAndAccounted() public {
+        uint256 b0 = usdc.balanceOf(bob);
+        _bid(bob, START);
+        _bid(bob, START + INC);
+        assertEq(usdc.balanceOf(bob), b0 - (START + INC));
+        assertEq(usdc.balanceOf(address(auction)), START + INC);
+    }
+
+    function test_Bid_SellerCannotBid() public {
+        vm.prank(alice);
+        vm.expectRevert(DomixValidation.SelfTrade.selector);
+        auction.bid(aid, START);
+    }
+
+    function test_Bid_RevertsAtOrAfterEnd() public {
+        vm.warp(_endTime());
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.Expired.selector);
+        auction.bid(aid, START);
+    }
+
+    function test_Bid_RevertsInvalidIdAndInvalidPrice() public {
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        auction.bid(0, START);
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        auction.bid(77, START);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.InvalidPrice.selector, 5, 10_000, type(uint128).max));
+        auction.bid(aid, 5);
+    }
+
+    function test_Bid_RevertsWhenNameExpired() public {
+        reg.expire(tokenId);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(DomixValidation.NameExpired.selector, block.timestamp));
+        auction.bid(aid, START);
+    }
+
+    function test_Bid_RevertsWhenRegistrarExpiryUnreadable() public {
+        // registrar that reverts on nameExpires -> hasExpiry collection yields InvalidExpiry
+        vm.mockCallRevert(address(reg), abi.encodeWithSignature("nameExpires(uint256)", tokenId), "boom");
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidExpiry.selector);
+        auction.bid(aid, START);
+    }
+
+    function test_Bid_RevertsWithoutAllowance() public {
+        address nobody = makeAddr("nobody");
+        usdc.mint(nobody, START);
+        vm.prank(nobody);
+        vm.expectRevert();
+        auction.bid(aid, START);
+        assertEq(_auction(aid).highestBidder, address(0), "state rolled back");
+    }
+
+    function test_Bid_WorksWhileAuctionPaused() public {
+        vm.prank(owner);
+        auction.pause();
+        _bid(bob, START);
+        assertEq(_auction(aid).highestBidder, bob);
+    }
+
+    function test_Bid_WorksWhileMarketplacePaused() public {
+        vm.prank(owner);
+        market.pause();
+        _bid(bob, START);
+        assertEq(_auction(aid).highestBidder, bob);
+    }
+
+    function test_Bid_RevertsOnSettledAuction() public {
+        skip(DURATION);
+        auction.settle(aid);
+        vm.prank(bob);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        auction.bid(aid, START);
+    }
+
+    function test_Bid_PlainCollectionIgnoresExpiry() public {
+        uint256 pid = plainReg.register("p", alice, 0);
+        _approveNFT(plainReg, alice, address(auction), pid);
+        vm.prank(alice);
+        uint256 id2 = auction.createAuction(address(plainReg), pid, START, INC, 1 days);
+        vm.prank(bob);
+        auction.bid(id2, START);
+        assertEq(_auction(id2).highestBidder, bob);
+    }
+
+    // ---- anti-snipe ----------------------------------------------------
+    function test_AntiSnipe_NoExtensionWhenTenMinutesOrMoreRemain() public {
+        uint64 end = _endTime();
+        vm.warp(end - 10 minutes);
+        _bid(bob, START);
+        assertEq(_endTime(), end);
+    }
+
+    function test_AntiSnipe_ExtendsToTenMinutesFromBid() public {
+        uint64 end = _endTime();
+        vm.warp(end - 10 minutes + 1);
+        vm.expectEmit(true, false, false, true, address(auction));
+        emit DomixAuction.AuctionExtended(aid, uint64(block.timestamp + 10 minutes));
+        _bid(bob, START);
+        assertEq(_endTime(), block.timestamp + 10 minutes);
+        // a late bid at end - 1 pushes the end again
+        vm.warp(_endTime() - 1);
+        _bid(carol, START + INC);
+        assertEq(_endTime(), block.timestamp + 10 minutes);
+    }
+
+    function test_AntiSnipe_SettleBlockedUntilExtendedEnd() public {
+        vm.warp(_endTime() - 1 minutes);
+        _bid(bob, START);
+        vm.warp(block.timestamp + 9 minutes);
+        vm.expectRevert(DomixAuction.NotEnded.selector);
+        auction.settle(aid);
+        vm.warp(_endTime());
+        auction.settle(aid);
+        assertEq(reg.ownerOf(tokenId), bob);
+    }
+
+    function test_AntiSnipe_CappedAtHardEnd() public {
+        DomixAuction.Auction memory a0 = _auction(aid);
+        uint64 hard = a0.hardEnd;
+        uint256 amount = START;
+        uint256 i;
+        while (true) {
+            vm.warp(_endTime() - 1);
+            if (block.timestamp + 10 minutes >= hard) break;
+            _bid(i % 2 == 0 ? bob : carol, amount);
+            amount += INC;
+            ++i;
+            assertLt(_endTime(), hard);
+        }
+        // final extension is capped at hardEnd exactly
+        _bid(i % 2 == 0 ? bob : carol, amount);
+        assertEq(_endTime(), hard, "capped at hardEnd");
+        assertGt(i, 100, "many extensions needed");
+
+        // later bid inside the window cannot extend beyond hardEnd
+        amount += INC;
+        vm.warp(hard - 1);
+        _bid(i % 2 == 0 ? carol : bob, amount);
+        assertEq(_endTime(), hard);
+        // at hardEnd no more bids
+        vm.warp(hard);
+        vm.prank(stranger);
+        vm.expectRevert(DomixValidation.Expired.selector);
+        auction.bid(aid, amount + INC);
+        auction.settle(aid);
+        assertEq(_auction(aid).status, 1);
+    }
+
+    // ---- settle --------------------------------------------------------
+    function test_Settle_WinnerGetsNFT_SellerAndTreasuryPaid() public {
+        uint256 bid_ = 200 * ONE;
+        _bid(bob, bid_);
+        uint256 fee = bid_ * FEE_BPS / 10_000; // 5 USDC
+        uint256 a0 = usdc.balanceOf(alice);
+        skip(DURATION);
+
+        vm.expectEmit(true, true, true, true, address(auction));
+        emit DomixAuction.AuctionSettled(aid, alice, bob, bid_, fee);
+        vm.prank(stranger); // permissionless
+        auction.settle(aid);
+
+        assertEq(reg.ownerOf(tokenId), bob);
+        assertEq(usdc.balanceOf(alice), a0 + bid_ - fee);
+        assertEq(usdc.balanceOf(treasury), fee);
+        assertEq(fee, 5 * ONE);
+        assertEq(usdc.balanceOf(address(auction)), 0);
+        assertEq(_auction(aid).status, 1);
+        // marketplace accounting
+        assertEq(market.salesCount(), 1);
+        assertEq(market.totalVolume(), bid_);
+        assertEq(market.totalFees(), fee);
+    }
+
+    function test_Settle_UsesCreationTimeFeeSnapshot() public {
+        _bid(bob, 1_000 * ONE);
+        vm.prank(owner);
+        market.setFee(1000);
+        skip(DURATION);
+        auction.settle(aid);
+        assertEq(usdc.balanceOf(treasury), 1_000 * ONE * FEE_BPS / 10_000);
+    }
+
+    function test_Settle_ZeroFeeSkipsTreasury() public {
+        vm.prank(owner);
+        market.setFee(0);
+        uint256 id2 = _mint(reg, "second", alice);
+        _approveNFT(reg, alice, address(auction), id2);
+        vm.prank(alice);
+        uint256 a2 = auction.createAuction(address(reg), id2, START, INC, 1 days);
+        vm.prank(bob);
+        auction.bid(a2, START);
+        skip(1 days);
+        uint256 a0 = usdc.balanceOf(alice);
+        auction.settle(a2);
+        assertEq(usdc.balanceOf(alice), a0 + START);
+        assertEq(usdc.balanceOf(treasury), 0);
+    }
+
+    function test_Settle_RevertsBeforeEnd() public {
+        _bid(bob, START);
+        vm.expectRevert(DomixAuction.NotEnded.selector);
+        auction.settle(aid);
+    }
+
+    function test_Settle_RevertsTwiceAndInvalidId() public {
+        skip(DURATION);
+        auction.settle(aid);
+        vm.expectRevert(DomixValidation.InvalidStatus.selector);
+        auction.settle(aid);
+        vm.expectRevert(DomixValidation.InvalidId.selector);
+        auction.settle(0);
+    }
+
+    function test_Settle_NoBidReturnsNFTToSeller() public {
+        skip(DURATION);
+        vm.expectEmit(true, true, true, true, address(auction));
+        emit DomixAuction.AuctionSettled(aid, alice, address(0), 0, 0);
+        auction.settle(aid);
+        assertEq(reg.ownerOf(tokenId), alice);
+        assertEq(_auction(aid).status, 1);
+        assertEq(market.salesCount(), 0);
+    }
+
+    function test_Settle_WorksWhenSettlerRevoked_EmitsAccountingFailed() public {
+        _bid(bob, START);
+        vm.prank(owner);
+        market.setSettler(address(auction), false);
+        skip(DURATION);
+        vm.expectEmit(true, false, false, false, address(auction));
+        emit DomixAuction.SaleAccountingFailed(aid);
+        auction.settle(aid);
+        assertEq(reg.ownerOf(tokenId), bob);
+        assertEq(usdc.balanceOf(alice), 1_000_000 * ONE + START - START * FEE_BPS / 10_000);
+        assertEq(market.salesCount(), 0);
+    }
+
+    function test_Settle_WorksWhileAuctionAndMarketplacePaused() public {
+        _bid(bob, START);
+        vm.startPrank(owner);
+        auction.pause();
+        market.pause();
+        vm.stopPrank();
+        skip(DURATION);
+        auction.settle(aid);
+        assertEq(reg.ownerOf(tokenId), bob);
+    }
+
+    function test_Settle_WorksAfterCollectionDelisted() public {
+        _bid(bob, START);
+        vm.prank(owner);
+        market.setCollection(address(reg), false, true);
+        skip(DURATION);
+        auction.settle(aid);
+        assertEq(reg.ownerOf(tokenId), bob);
+    }
+
+    function test_Settle_SellerBlacklisted_ProceedsCredited() public {
+        _bid(bob, START);
+        usdc.setBlacklisted(alice, true);
+        skip(DURATION);
+        uint256 proceeds = START - START * FEE_BPS / 10_000;
+        vm.expectEmit(true, false, false, true, address(auction));
+        emit DomixAuction.RefundCredited(alice, proceeds);
+        auction.settle(aid);
+        assertEq(reg.ownerOf(tokenId), bob);
+        assertEq(auction.pendingReturns(alice), proceeds);
+        assertEq(usdc.balanceOf(address(auction)), proceeds);
+    }
+
+    function test_Settle_TreasuryBlacklisted_FeeCreditedAndSaleCompletes() public {
+        _bid(bob, START);
+        usdc.setBlacklisted(treasury, true);
+        skip(DURATION);
+        auction.settle(aid);
+        assertEq(auction.pendingReturns(treasury), START * FEE_BPS / 10_000);
+        assertEq(reg.ownerOf(tokenId), bob);
+    }
+
+    function testFuzz_Settle_ExactFeeSplit(uint256 bid_, uint16 bps) public {
+        bps = uint16(bound(bps, 0, 1000));
+        bid_ = bound(bid_, START, 900_000 * ONE);
+        vm.prank(owner);
+        market.setFee(bps);
+        uint256 id2 = _mint(reg, "second", alice);
+        _approveNFT(reg, alice, address(auction), id2);
+        vm.prank(alice);
+        uint256 a2 = auction.createAuction(address(reg), id2, START, INC, 1 days);
+        vm.prank(bob);
+        auction.bid(a2, bid_);
+        skip(1 days);
+        uint256 fee = bid_ * bps / 10_000;
+        uint256 a0 = usdc.balanceOf(alice);
+        uint256 t0 = usdc.balanceOf(treasury);
+        auction.settle(a2);
+        assertEq(usdc.balanceOf(alice) - a0, bid_ - fee);
+        assertEq(usdc.balanceOf(treasury) - t0, fee);
+        assertEq(usdc.balanceOf(address(auction)), 0 + 0);
+    }
+}

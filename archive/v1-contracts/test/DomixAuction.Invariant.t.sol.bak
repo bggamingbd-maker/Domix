@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {Test, console2} from "forge-std/Test.sol";
+import {DomixTestBase} from "./DomixBase.t.sol";
+import "./DomixImports.sol";
+
+/// @dev Drives bounded, mostly-successful random auction activity.
+contract AuctionHandler is Test {
+    DomixAuction public auction;
+    BlacklistUSDC public usdc;
+    MockRegistrar public reg;
+    address public seller;
+    address[] public actors; // seller, bidders, treasury
+    uint256[] public tokens;
+
+    uint256 public created;
+    uint256 public bids;
+    uint256 public outbids;
+    uint256 public settled;
+    uint256 public failedSettles;
+    uint256 public cancelled;
+    uint256 public credited;
+    uint256 public withdrawn;
+    uint256 public totalWarped;
+
+    constructor(DomixAuction a, BlacklistUSDC u, MockRegistrar r, address seller_, address[] memory actors_, uint256[] memory tokens_) {
+        auction = a;
+        usdc = u;
+        reg = r;
+        seller = seller_;
+        actors = actors_;
+        tokens = tokens_;
+    }
+
+    function _pickAuction(uint256 seed) internal view returns (uint256 id, bool ok) {
+        uint256 n = auction.nextAuctionId();
+        if (n <= 1) return (0, false);
+        // bias toward the 3 most recent auctions so bids/outbids/settles actually land
+        uint256 span = n - 1 < 3 ? n - 1 : 3;
+        return (n - 1 - (seed % span), true);
+    }
+
+    function create(uint256 tokenSeed, uint256 start, uint256 inc, uint256 dur) external {
+        uint256 tid = tokens[tokenSeed % tokens.length];
+        start = bound(start, 10_000, 500e6);
+        inc = bound(inc, 10_000, 50e6);
+        dur = bound(dur, 1 hours, 14 days);
+        vm.prank(seller);
+        try auction.createAuction(address(reg), tid, start, inc, dur) {
+            ++created;
+        } catch {}
+    }
+
+    function bid(uint256 actorSeed, uint256 auctionSeed, uint256 extra) external {
+        (uint256 id, bool ok) = _pickAuction(auctionSeed);
+        if (!ok) return;
+        address who = actors[1 + actorSeed % (actors.length - 2)]; // bidders only (skip seller, treasury)
+        uint256 amount = auction.minNextBid(id) + bound(extra, 0, 100e6);
+        bool hadBidder = auction.getAuction(id).highestBidder != address(0);
+        vm.prank(who);
+        try auction.bid(id, amount) {
+            ++bids;
+            if (hadBidder) ++outbids;
+        } catch {}
+    }
+
+    function warp(uint256 secs) external {
+        secs = bound(secs, 1, 2 days);
+        if (totalWarped + secs > 60 days) return;
+        totalWarped += secs;
+        vm.warp(block.timestamp + secs);
+    }
+
+    function settle(uint256 auctionSeed) external {
+        (uint256 id, bool ok) = _pickAuction(auctionSeed);
+        if (!ok) return;
+        try auction.settle(id) {
+            if (auction.getAuction(id).status == 3) ++failedSettles;
+            else ++settled;
+        } catch {}
+    }
+
+    function cancel(uint256 auctionSeed) external {
+        (uint256 id, bool ok) = _pickAuction(auctionSeed);
+        if (!ok || auctionSeed % 6 != 0) return; // cancel is rare so auctions accumulate bids
+        vm.prank(seller);
+        try auction.cancelAuction(id, seller) {
+            ++cancelled;
+        } catch {}
+    }
+
+    function claim(uint256 auctionSeed) external {
+        (uint256 id, bool ok) = _pickAuction(auctionSeed);
+        if (!ok) return;
+        vm.prank(seller);
+        try auction.claimUndelivered(id, seller) {} catch {}
+    }
+
+    function withdraw(uint256 actorSeed) external {
+        address who = actors[actorSeed % actors.length];
+        vm.prank(who);
+        try auction.withdrawRefund() {
+            ++withdrawn;
+        } catch {}
+    }
+
+    function blacklist(uint256 actorSeed, uint8 mode) external {
+        // blacklist ~1 in 4 calls, otherwise clear
+        usdc.setBlacklisted(actors[actorSeed % actors.length], mode % 4 == 0);
+    }
+
+    function expireName(uint256 tokenSeed) external {
+        if (tokenSeed % 5 != 0) return;
+        reg.expire(tokens[tokenSeed % tokens.length]);
+    }
+
+    function renewName(uint256 tokenSeed) external {
+        reg.setExpiry(tokens[tokenSeed % tokens.length], block.timestamp + 3650 days);
+    }
+
+    function actorsLength() external view returns (uint256) {
+        return actors.length;
+    }
+}
+
+contract DomixAuctionInvariantTest is DomixTestBase {
+    AuctionHandler internal handler;
+    address[] internal actors;
+
+    function setUp() public override {
+        super.setUp();
+        uint256[] memory toks = new uint256[](6);
+        for (uint256 i; i < 6; ++i) {
+            toks[i] = reg.register(string.concat("inv", vm.toString(i)), alice, block.timestamp + 3650 days);
+        }
+        vm.prank(alice);
+        reg.setApprovalForAll(address(auction), true);
+
+        actors.push(alice);
+        actors.push(bob);
+        actors.push(carol);
+        actors.push(stranger);
+        actors.push(treasury);
+
+        handler = new AuctionHandler(auction, usdc, reg, alice, actors, toks);
+        targetContract(address(handler));
+    }
+
+    /// @dev USDC held == sum(highest bids of Active auctions) + sum(pendingReturns).
+    function invariant_UsdcBalanceEqualsActiveBidsPlusPendingReturns() public view {
+        uint256 expected;
+        uint256 n = auction.nextAuctionId();
+        for (uint256 id = 1; id < n; ++id) {
+            DomixAuction.Auction memory a = auction.getAuction(id);
+            if (a.status == 0 && a.highestBidder != address(0)) expected += a.highestBid;
+        }
+        for (uint256 i; i < actors.length; ++i) expected += auction.pendingReturns(actors[i]);
+        assertEq(usdc.balanceOf(address(auction)), expected);
+    }
+
+    /// @dev Active auctions always hold their NFT in escrow and never exceed hardEnd.
+    function invariant_ActiveAuctionsEscrowNFTAndRespectHardEnd() public view {
+        uint256 n = auction.nextAuctionId();
+        for (uint256 id = 1; id < n; ++id) {
+            DomixAuction.Auction memory a = auction.getAuction(id);
+            if (a.status == 0) {
+                assertEq(reg.ownerOf(a.tokenId), address(auction));
+                assertLe(a.endTime, a.hardEnd);
+            }
+        }
+    }
+
+    /// @dev A token is escrowed by at most one Active auction at a time.
+    function invariant_OneActiveAuctionPerToken() public view {
+        uint256 n = auction.nextAuctionId();
+        for (uint256 i = 1; i < n; ++i) {
+            DomixAuction.Auction memory a = auction.getAuction(i);
+            if (a.status != 0) continue;
+            for (uint256 j = i + 1; j < n; ++j) {
+                DomixAuction.Auction memory b = auction.getAuction(j);
+                if (b.status == 0) assertTrue(a.tokenId != b.tokenId);
+            }
+        }
+    }
+
+    function afterInvariant() public view {
+        console2.log("created", handler.created());
+        console2.log("bids", handler.bids());
+        console2.log("outbids", handler.outbids());
+        console2.log("settled", handler.settled());
+        console2.log("failedSettles", handler.failedSettles());
+        console2.log("cancelled", handler.cancelled());
+        console2.log("withdrawn", handler.withdrawn());
+    }
+}

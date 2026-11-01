@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {DomixAdmin, DomixValidation} from "./interfaces/IDomix.sol";
+
+/// @title DOMIX non-custodial registrar-token marketplace
+/// @notice Sellers retain their NFTs until purchase. Only existing registrar NFTs are traded.
+/// @dev Uses a constructor-supplied, standard six-decimal USDC token, never a native currency.
+contract DomixMarketplace is DomixAdmin, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    struct Listing { address seller; uint128 price; uint64 expiresAt; }
+    struct Collection { bool allowed; bool hasExpiry; }
+
+    IERC20 public immutable usdc;
+    address public treasury;
+    uint16 public feeBps;
+    uint64 public minExpiryBuffer = 7 days;
+    mapping(address => Collection) public collectionInfo;
+    mapping(address => bool) public isSettler;
+    mapping(address => mapping(uint256 => Listing)) private _listings;
+    uint256 public salesCount;
+    uint256 public totalVolume;
+    uint256 public totalFees;
+
+    error MissingListing();
+    error NotSeller();
+    error NotApproved();
+    error PriceAboveMaximum(uint256 price, uint256 maximum);
+    error NotSettler();
+    error InvalidBuffer();
+
+    event CollectionSet(address indexed collection, bool allowed, bool hasExpiry);
+    event FeeSet(uint16 feeBps);
+    event TreasurySet(address indexed treasury);
+    event MinExpiryBufferSet(uint64 buffer);
+    event SettlerSet(address indexed settler, bool allowed);
+    event Listed(address indexed collection, uint256 indexed tokenId, address indexed seller, uint256 price, uint64 expiresAt);
+    event ListingUpdated(address indexed collection, uint256 indexed tokenId, address indexed seller, uint256 price, uint64 expiresAt);
+    event ListingCancelled(address indexed collection, uint256 indexed tokenId, address indexed seller);
+    event Sold(address indexed collection, uint256 indexed tokenId, address seller, address indexed buyer, uint256 price, uint256 fee);
+    event ExternalSaleRecorded(address indexed collection, uint256 indexed tokenId, address indexed settler, uint256 price, uint256 fee);
+
+    constructor(IERC20 usdc_, address treasury_, uint16 feeBps_, address owner_) DomixAdmin(owner_) {
+        DomixValidation.requireContract(address(usdc_));
+        if (treasury_ == address(0)) revert DomixValidation.ZeroAddress();
+        if (feeBps_ > MAX_FEE_BPS) revert DomixValidation.InvalidFee();
+        usdc = usdc_;
+        treasury = treasury_;
+        feeBps = feeBps_;
+        emit TreasurySet(treasury_);
+        emit FeeSet(feeBps_);
+        emit MinExpiryBufferSet(minExpiryBuffer);
+    }
+
+    /// @notice Curates trusted ERC-721 registrars; hasExpiry requires a working nameExpires getter.
+    function setCollection(address collection, bool allowed, bool hasExpiry) external onlyOwner {
+        DomixValidation.requireContract(collection);
+        collectionInfo[collection] = Collection(allowed, hasExpiry);
+        emit CollectionSet(collection, allowed, hasExpiry);
+    }
+
+    function setFee(uint16 newFee) external onlyOwner {
+        if (newFee > MAX_FEE_BPS) revert DomixValidation.InvalidFee();
+        feeBps = newFee;
+        emit FeeSet(newFee);
+    }
+
+    function setTreasury(address newTreasury) external onlyOwner {
+        if (newTreasury == address(0)) revert DomixValidation.ZeroAddress();
+        treasury = newTreasury;
+        emit TreasurySet(newTreasury);
+    }
+
+    function setMinExpiryBuffer(uint64 buffer) external onlyOwner {
+        if (buffer > 90 days) revert InvalidBuffer();
+        minExpiryBuffer = buffer;
+        emit MinExpiryBufferSet(buffer);
+    }
+
+    /// @notice Only trusted settlement contracts should be authorized to report volume and clear listings.
+    function setSettler(address settler, bool allowed) external onlyOwner {
+        if (settler == address(0)) revert DomixValidation.ZeroAddress();
+        if (allowed) DomixValidation.requireContract(settler);
+        isSettler[settler] = allowed;
+        emit SettlerSet(settler, allowed);
+    }
+
+    /// @notice Lists an owned, approved NFT without taking custody; stale entries may be overwritten.
+    function list(address collection, uint256 tokenId, uint256 price, uint256 duration) external whenNotPaused {
+        uint64 expiry = _validateListing(collection, tokenId, price, duration);
+        Listing memory old = _listings[collection][tokenId];
+        if (old.seller != address(0)) emit ListingCancelled(collection, tokenId, old.seller);
+        _listings[collection][tokenId] = Listing(msg.sender, uint128(price), expiry);
+        emit Listed(collection, tokenId, msg.sender, price, expiry);
+    }
+
+    function updateListing(address collection, uint256 tokenId, uint256 newPrice, uint256 newDuration)
+        external whenNotPaused
+    {
+        if (_listings[collection][tokenId].seller != msg.sender) revert NotSeller();
+        uint64 expiry = _validateListing(collection, tokenId, newPrice, newDuration);
+        _listings[collection][tokenId] = Listing(msg.sender, uint128(newPrice), expiry);
+        emit ListingUpdated(collection, tokenId, msg.sender, newPrice, expiry);
+    }
+
+    /// @notice Seller may cancel even while paused. Anyone may clear expired or ownership-stale entries.
+    function cancelListing(address collection, uint256 tokenId) external {
+        Listing memory entry = _listings[collection][tokenId];
+        if (entry.seller == address(0)) revert MissingListing();
+        if (msg.sender != entry.seller && block.timestamp < entry.expiresAt
+            && DomixValidation.currentOwner(collection, tokenId) == entry.seller) revert NotSeller();
+        _cancel(collection, tokenId, entry.seller);
+    }
+
+    /// @notice Atomically pays the seller/treasury and safely transfers the existing registrar NFT.
+    function buy(address collection, uint256 tokenId, uint256 maxPrice) external nonReentrant whenNotPaused {
+        Listing memory entry = _listings[collection][tokenId];
+        if (entry.seller == address(0)) revert MissingListing();
+        if (!isListingValid(collection, tokenId)) revert DomixValidation.InvalidStatus();
+        if (msg.sender == entry.seller) revert DomixValidation.SelfTrade();
+        if (entry.price > maxPrice) revert PriceAboveMaximum(entry.price, maxPrice);
+        delete _listings[collection][tokenId];
+        (uint256 fee, uint256 proceeds) = quoteFee(entry.price);
+        _record(entry.price, fee);
+        usdc.safeTransferFrom(msg.sender, entry.seller, proceeds);
+        if (fee != 0) usdc.safeTransferFrom(msg.sender, treasury, fee);
+        IERC721(collection).safeTransferFrom(entry.seller, msg.sender, tokenId);
+        emit Sold(collection, tokenId, entry.seller, msg.sender, entry.price, fee);
+    }
+
+    /// @notice Accounts for trusted offer/auction settlements, even when paused or delisted.
+    /// @dev Does not move assets. Fee can reflect an auction's creation-time fee snapshot.
+    function recordExternalSale(address collection, uint256 tokenId, uint256 price, uint256 fee) external {
+        if (!isSettler[msg.sender]) revert NotSettler();
+        DomixValidation.requireContract(collection);
+        DomixValidation.requirePrice(price);
+        if (fee > price * MAX_FEE_BPS / BPS) revert DomixValidation.InvalidFee();
+        address seller = _listings[collection][tokenId].seller;
+        if (seller != address(0)) _cancel(collection, tokenId, seller);
+        _record(price, fee);
+        emit ExternalSaleRecorded(collection, tokenId, msg.sender, price, fee);
+    }
+
+    function getListing(address collection, uint256 tokenId) external view returns (Listing memory) {
+        return _listings[collection][tokenId];
+    }
+
+    function quoteFee(uint256 price) public view returns (uint256 fee, uint256 sellerProceeds) {
+        DomixValidation.requirePrice(price);
+        fee = price * feeBps / BPS;
+        sellerProceeds = price - fee;
+    }
+
+    /// @notice Includes collection policy, ownership, approval, time and name-expiry checks.
+    function isListingValid(address collection, uint256 tokenId) public view returns (bool) {
+        Listing memory entry = _listings[collection][tokenId];
+        Collection memory info = collectionInfo[collection];
+        if (!info.allowed || entry.seller == address(0) || block.timestamp >= entry.expiresAt) return false;
+        if (DomixValidation.currentOwner(collection, tokenId) != entry.seller) return false;
+        if (!DomixValidation.approved(collection, tokenId, entry.seller, address(this))) return false;
+        return !info.hasExpiry || DomixValidation.expiryAfter(
+            collection, tokenId, uint256(entry.expiresAt) + minExpiryBuffer
+        );
+    }
+
+    function _validateListing(address collection, uint256 tokenId, uint256 price, uint256 duration)
+        private view returns (uint64 expiry)
+    {
+        if (!collectionInfo[collection].allowed) revert DomixValidation.CollectionNotAllowed();
+        DomixValidation.requirePrice(price);
+        if (duration < 1 hours || duration > 365 days) revert DomixValidation.InvalidDuration();
+        if (DomixValidation.currentOwner(collection, tokenId) != msg.sender) revert DomixValidation.NotTokenOwner();
+        if (!DomixValidation.approved(collection, tokenId, msg.sender, address(this))) revert NotApproved();
+        expiry = uint64(block.timestamp + duration);
+        if (collectionInfo[collection].hasExpiry
+            && !DomixValidation.expiryAfter(collection, tokenId, uint256(expiry) + minExpiryBuffer)) {
+            revert DomixValidation.InvalidExpiry();
+        }
+    }
+
+    function _cancel(address collection, uint256 tokenId, address seller) private {
+        delete _listings[collection][tokenId];
+        emit ListingCancelled(collection, tokenId, seller);
+    }
+
+    function _record(uint256 price, uint256 fee) private {
+        ++salesCount;
+        totalVolume += price;
+        totalFees += fee;
+    }
+}

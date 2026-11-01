@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {Test} from "forge-std/Test.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IDomixMarketplace, DomixValidation} from "../interfaces/IDomix.sol";
+import {DomixMarketplace} from "../DomixMarketplace.sol";
+import {DomixOffers} from "../DomixOffers.sol";
+import {DomixAuction} from "../DomixAuction.sol";
+import {DomixProfiles} from "../DomixProfiles.sol";
+import {BlacklistUSDC} from "./mocks/MockUSDC.sol";
+import {MockRegistrar} from "./mocks/MockRegistrar.sol";
+import {ContractBidder} from "./mocks/ContractBidder.sol";
+
+/// @dev Shared deployment + helpers. No test functions here.
+abstract contract DomixTestBase is Test {
+    uint256 internal constant T0 = 1_700_000_000;
+    uint16 internal constant FEE_BPS = 250; // 2.5%
+    uint256 internal constant ONE = 1e6;
+
+    address internal owner = makeAddr("owner");
+    address internal treasury = makeAddr("treasury");
+    address internal alice = makeAddr("alice"); // default seller / name holder
+    address internal bob = makeAddr("bob");
+    address internal carol = makeAddr("carol");
+    address internal stranger = makeAddr("stranger");
+
+    BlacklistUSDC internal usdc;
+    MockRegistrar internal reg; // allowed, hasExpiry = true
+    MockRegistrar internal plainReg; // allowed, hasExpiry = false
+    MockRegistrar internal otherReg; // never allowed
+    DomixMarketplace internal market;
+    DomixOffers internal offers;
+    DomixAuction internal auction;
+    DomixProfiles internal profiles;
+
+    function setUp() public virtual {
+        vm.warp(T0);
+        usdc = new BlacklistUSDC();
+        reg = new MockRegistrar();
+        plainReg = new MockRegistrar();
+        otherReg = new MockRegistrar();
+
+        market = new DomixMarketplace(IERC20(address(usdc)), treasury, FEE_BPS, owner);
+        offers = new DomixOffers(IDomixMarketplace(address(market)), owner);
+        auction = new DomixAuction(IDomixMarketplace(address(market)), owner);
+        profiles = new DomixProfiles(IDomixMarketplace(address(market)));
+
+        vm.startPrank(owner);
+        market.setCollection(address(reg), true, true);
+        market.setCollection(address(plainReg), true, false);
+        market.setSettler(address(offers), true);
+        market.setSettler(address(auction), true);
+        vm.stopPrank();
+
+        address[4] memory users = [alice, bob, carol, stranger];
+        for (uint256 i; i < users.length; ++i) {
+            usdc.mint(users[i], 1_000_000 * ONE);
+            vm.startPrank(users[i]);
+            usdc.approve(address(market), type(uint256).max);
+            usdc.approve(address(offers), type(uint256).max);
+            usdc.approve(address(auction), type(uint256).max);
+            vm.stopPrank();
+        }
+    }
+
+    // ---- helpers -------------------------------------------------------
+
+    function _id(string memory label) internal pure returns (uint256) {
+        return uint256(keccak256(bytes(label)));
+    }
+
+    /// @dev Registers `label` in `r` to `to`, expiring in 365 days.
+    function _mint(MockRegistrar r, string memory label, address to) internal returns (uint256 id) {
+        id = r.register(label, to, block.timestamp + 365 days);
+    }
+
+    function _approveNFT(MockRegistrar r, address holder, address operator, uint256 id) internal {
+        vm.prank(holder);
+        r.approve(operator, id);
+    }
+
+    function _list(address seller, uint256 id, uint256 price, uint256 duration) internal {
+        vm.prank(seller);
+        market.list(address(reg), id, price, duration);
+    }
+
+    /// @dev Mint to alice, approve market, list at `price` for 7 days.
+    function _listed(string memory label, uint256 price) internal returns (uint256 id) {
+        id = _mint(reg, label, alice);
+        _approveNFT(reg, alice, address(market), id);
+        _list(alice, id, price, 7 days);
+    }
+
+    function _fee(uint256 price, uint256 bps) internal pure returns (uint256) {
+        return price * bps / 10_000;
+    }
+
+    function _newBidder() internal returns (ContractBidder b) {
+        b = new ContractBidder();
+        usdc.mint(address(b), 1_000_000 * ONE);
+    }
+}

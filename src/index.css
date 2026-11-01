@@ -1,0 +1,505 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@property --angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+
+:root {
+  --bg: #02040b;
+  --bg-2: #050a1a;
+  --surface: rgba(255, 255, 255, 0.045);
+  --surface-strong: rgba(255, 255, 255, 0.085);
+  --surface-muted: #0a1430;
+  --ink: #f3f6ff;
+  --ink-2: #dbe4fb;
+  --muted: #a6b4d4;
+  --subtle: #7587ad;
+  --border: rgba(130, 165, 255, 0.15);
+  --border-strong: rgba(130, 165, 255, 0.4);
+  --accent: #3b82ff;
+  --accent-hover: #7aa8ff;
+  --accent-ink: #ffffff;
+  --blue: #3b82ff;
+  --violet: #8b5cf6;
+  --cyan: #22d3ee;
+  --success: #5eead4;
+  --danger: #ff7a8a;
+  --warn: #f5c76b;
+  --grad: linear-gradient(110deg, #3b82ff 0%, #8b5cf6 55%, #22d3ee 120%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  font-family: 'Inter', sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  background-image: linear-gradient(180deg, #02040b 0%, #040920 55%, #070e2b 100%);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+h1,
+h2,
+h3,
+.display {
+  font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+  letter-spacing: -0.035em;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', Menlo, monospace;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Surfaces ---------- */
+.glass {
+  position: relative;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.022));
+  border: 1px solid var(--border);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 24px 60px -34px rgba(59, 130, 255, 0.4);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  transition:
+    border-color 0.25s ease,
+    box-shadow 0.25s ease;
+}
+
+.glass:hover {
+  border-color: var(--border-strong);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 28px 70px -30px rgba(139, 92, 246, 0.5);
+}
+
+.glow-border {
+  position: relative;
+}
+
+.glow-border::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: conic-gradient(from var(--angle), #3b82ff, #8b5cf6, #22d3ee, #3b82ff);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: spin-angle 7s linear infinite;
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.label-caps {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--subtle);
+  font-weight: 600;
+}
+
+/* ---------- Text effects ---------- */
+.grad-text {
+  background-image: linear-gradient(90deg, #4d8dff, #8b5cf6, #22d3ee, #4d8dff);
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: grad-shift 9s linear infinite;
+}
+
+.glow-num {
+  text-shadow:
+    0 0 22px rgba(59, 130, 255, 0.55),
+    0 0 48px rgba(139, 92, 246, 0.25);
+}
+
+.caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 3px;
+  vertical-align: -0.12em;
+  background: var(--cyan);
+  animation: blink 1s steps(1) infinite;
+}
+
+/* ---------- Buttons ---------- */
+.btn-grad {
+  background-image: var(--grad);
+  background-size: 160% 100%;
+  color: #fff;
+  box-shadow: 0 8px 28px -10px rgba(59, 130, 255, 0.75);
+  transition:
+    background-position 0.4s ease,
+    box-shadow 0.25s ease,
+    filter 0.25s ease;
+}
+
+.btn-grad:hover:not(:disabled) {
+  background-position: 100% 0;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.18),
+    0 10px 40px -6px rgba(139, 92, 246, 0.85);
+  filter: saturate(1.15);
+}
+
+/* ---------- Background ---------- */
+.orb {
+  position: absolute;
+  border-radius: 9999px;
+  will-change: transform;
+}
+
+.orb-a {
+  width: 640px;
+  height: 640px;
+  left: -180px;
+  top: -140px;
+  background: radial-gradient(closest-side, rgba(59, 130, 255, 0.3), transparent);
+  animation: float-a 22s ease-in-out infinite;
+}
+
+.orb-b {
+  width: 560px;
+  height: 560px;
+  right: -160px;
+  top: 18vh;
+  background: radial-gradient(closest-side, rgba(139, 92, 246, 0.26), transparent);
+  animation: float-b 26s ease-in-out infinite;
+}
+
+.orb-c {
+  width: 520px;
+  height: 520px;
+  left: 30vw;
+  bottom: -220px;
+  background: radial-gradient(closest-side, rgba(34, 211, 238, 0.17), transparent);
+  animation: float-a 30s ease-in-out infinite reverse;
+}
+
+.cursor-glow {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 520px;
+  height: 520px;
+  margin: -260px 0 0 -260px;
+  border-radius: 9999px;
+  background: radial-gradient(closest-side, rgba(99, 140, 255, 0.16), transparent);
+  pointer-events: none;
+  z-index: 1;
+  will-change: transform;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+}
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid var(--border);
+}
+
+.skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 20%, rgba(130, 165, 255, 0.14) 50%, transparent 80%);
+  transform: translateX(-100%);
+  animation: shimmer 1.6s ease-in-out infinite;
+}
+
+/* ---------- Form ---------- */
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--subtle);
+}
+
+:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+/* ---------- Keyframes ---------- */
+@keyframes spin-angle {
+  to {
+    --angle: 360deg;
+  }
+}
+
+@keyframes grad-shift {
+  to {
+    background-position: 300% 0;
+  }
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@keyframes shimmer {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes float-a {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(60px, 50px, 0) scale(1.08);
+  }
+}
+
+@keyframes float-b {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(-70px, 40px, 0) scale(0.94);
+  }
+}
+
+@keyframes pulse-dot {
+  0% {
+    box-shadow: 0 0 0 0 rgba(94, 234, 212, 0.6);
+  }
+  100% {
+    box-shadow: 0 0 0 10px rgba(94, 234, 212, 0);
+  }
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: var(--success);
+  animation: pulse-dot 1.8s ease-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .glow-border::before,
+  .grad-text,
+  .orb {
+    animation: none !important;
+  }
+}
+
+.logo-orbit {
+  position: absolute;
+  inset: -4px;
+  border-radius: 12px;
+  border: 1.5px solid transparent;
+  border-top-color: rgba(34, 211, 238, 0.9);
+  border-right-color: rgba(139, 92, 246, 0.6);
+  animation: orbit 5s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes orbit {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .logo-orbit {
+    animation: none !important;
+  }
+}
+
+/* ---------- Domain tiles ---------- */
+.tile {
+  overflow: hidden;
+  transition:
+    border-color 0.25s ease,
+    box-shadow 0.25s ease;
+}
+
+.tile::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(115deg, transparent 30%, rgba(130, 165, 255, 0.11) 50%, transparent 70%);
+  transform: translateX(-120%);
+  transition: transform 0.75s cubic-bezier(0.16, 1, 0.3, 1);
+  pointer-events: none;
+}
+
+.tile:hover::after {
+  transform: translateX(120%);
+}
+
+.tile:hover {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 18px 50px -24px rgba(59, 130, 255, 0.65);
+}
+
+/* ---------- Featured tile idle motion (transform / opacity only) ---------- */
+@keyframes tile-bob {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(0, -4px, 0);
+  }
+}
+
+@keyframes avail-pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+.tile-float {
+  animation: tile-bob 6.5s ease-in-out infinite;
+  will-change: transform;
+}
+
+.tile-avail::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(120% 90% at 100% 100%, rgba(52, 211, 153, 0.22), transparent 60%);
+  animation: avail-pulse 3.4s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes sheen-loop {
+  0%,
+  62% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(120%);
+  }
+}
+
+/* Every featured tile: slow light sweep plus a breathing glow. */
+.tile-float::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(120% 90% at 100% 100%, rgba(77, 141, 255, 0.22), transparent 60%);
+  animation: avail-pulse 3.6s ease-in-out infinite;
+  animation-delay: var(--tile-delay, 0s);
+  pointer-events: none;
+}
+
+.tile-float::after {
+  animation: sheen-loop 7s ease-in-out infinite;
+  animation-delay: var(--tile-delay, 0s);
+}
+
+.tile-float:hover::after {
+  animation: none;
+  transform: translateX(120%);
+}
+
+.tile-float.tile-avail::before {
+  background: radial-gradient(120% 90% at 100% 100%, rgba(52, 211, 153, 0.24), transparent 60%);
+}
+
+/* Reduced motion: nothing travels, but the glow keeps breathing (opacity only) so the tab still feels alive. */
+@media (prefers-reduced-motion: reduce) {
+  .tile-float,
+  .tile-float::after {
+    animation: none !important;
+  }
+
+  .tile-float::before,
+  .tile-avail::before {
+    animation: avail-pulse 4.5s ease-in-out infinite !important;
+    animation-duration: 4.5s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
+/* ---------- Lite mode: phones, touch devices and reduced motion ----------
+   Set on <html> by index.html and App.tsx. No blur, no endless animations: smoother scrolling and less battery use. */
+html.lite .glass {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: linear-gradient(180deg, rgba(22, 29, 54, 0.92), rgba(12, 17, 34, 0.92));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+html.lite .glass:hover {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+
+html.lite header {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  background: rgba(2, 4, 11, 0.96) !important;
+}
+
+html.lite .glow-border::before,
+html.lite .grad-text,
+html.lite .logo-orbit,
+html.lite .tile-float,
+html.lite .tile-float::before,
+html.lite .tile-float::after,
+html.lite .tile-avail::before,
+html.lite .live-dot,
+html.lite .skeleton::after {
+  animation: none !important;
+}
+
+html.lite .tile-float::after {
+  display: none;
+}

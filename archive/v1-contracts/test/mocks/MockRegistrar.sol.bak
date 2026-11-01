@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+
+/// @notice ENS-style registrar stand-in. tokenId = uint256(keccak256(label)).
+contract MockRegistrar is ERC721 {
+    mapping(uint256 => uint256) private _expiry;
+    mapping(uint256 => address) public controllerOf;
+
+    /// @dev When true, transfers (not mints) of expired names revert.
+    bool public rejectTransfersWhenExpired;
+    /// @dev When true, ownerOf reverts for expired names (ENS BaseRegistrar behaviour).
+    bool public ownerOfRevertsWhenExpired;
+
+    error NameIsExpired(uint256 id);
+    error NotAuthorized();
+
+    constructor() ERC721("Mock Registrar", "MREG") {}
+
+    function idOf(string memory label) public pure returns (uint256) {
+        return uint256(keccak256(bytes(label)));
+    }
+
+    function register(string calldata label, address to, uint256 expiry) external returns (uint256 id) {
+        id = idOf(label);
+        _mint(to, id);
+        _expiry[id] = expiry;
+        controllerOf[id] = to;
+    }
+
+    function registerId(uint256 id, address to, uint256 expiry) external {
+        _mint(to, id);
+        _expiry[id] = expiry;
+        controllerOf[id] = to;
+    }
+
+    function nameExpires(uint256 id) external view returns (uint256) {
+        return _expiry[id];
+    }
+
+    function setExpiry(uint256 id, uint256 expiry) external {
+        _expiry[id] = expiry;
+    }
+
+    /// @dev Expires the name immediately (expiry == now counts as expired for consumers).
+    function expire(uint256 id) external {
+        _expiry[id] = block.timestamp;
+    }
+
+    function setRejectTransfersWhenExpired(bool flag) external {
+        rejectTransfersWhenExpired = flag;
+    }
+
+    function setOwnerOfRevertsWhenExpired(bool flag) external {
+        ownerOfRevertsWhenExpired = flag;
+    }
+
+    function reclaim(uint256 id, address newController) external {
+        address holder = _ownerOf(id);
+        if (holder == address(0) || !_isAuthorized(holder, msg.sender, id)) revert NotAuthorized();
+        controllerOf[id] = newController;
+    }
+
+    function ownerOf(uint256 id) public view override returns (address) {
+        if (ownerOfRevertsWhenExpired && _ownerOf(id) != address(0) && _expiry[id] <= block.timestamp) {
+            revert NameIsExpired(id);
+        }
+        return super.ownerOf(id);
+    }
+
+    function _update(address to, uint256 id, address auth) internal override returns (address) {
+        if (rejectTransfersWhenExpired && _ownerOf(id) != address(0) && _expiry[id] <= block.timestamp) {
+            revert NameIsExpired(id);
+        }
+        return super._update(to, id, auth);
+    }
+}

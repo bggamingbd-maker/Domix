@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IDomixMarketplace, DomixValidation} from "./interfaces/IDomix.sol";
+
+/// @title DOMIX owner-verified domain identity records
+/// @notice No administrator and no pause. Only the current registrar NFT owner may write.
+/// @dev Recommended keys: address (wallet), display, description, url, avatar, twitter,
+///      github, telegram, discord. Values are untrusted user text, not verified links.
+///      Records are owner-address scoped, not ownership-epoch scoped: if a former owner
+///      reacquires the NFT, their old records become visible again unless overwritten.
+contract DomixProfiles {
+    struct Record { string value; address setBy; }
+    IDomixMarketplace public immutable marketplace;
+    uint256 public constant MAX_KEY_BYTES = 64;
+    uint256 public constant MAX_VALUE_BYTES = 512;
+    uint256 public constant MAX_BATCH = 16;
+
+    /// @notice Recommended wallet address record key.
+    string public constant KEY_ADDRESS = "address";
+    /// @notice Recommended human-readable name key.
+    string public constant KEY_DISPLAY = "display";
+    /// @notice Recommended biography key.
+    string public constant KEY_DESCRIPTION = "description";
+    /// @notice Recommended website key.
+    string public constant KEY_URL = "url";
+    /// @notice Recommended avatar image URI key.
+    string public constant KEY_AVATAR = "avatar";
+    /// @notice Recommended Twitter/X identity key.
+    string public constant KEY_TWITTER = "twitter";
+    /// @notice Recommended GitHub identity key.
+    string public constant KEY_GITHUB = "github";
+    /// @notice Recommended Telegram identity key.
+    string public constant KEY_TELEGRAM = "telegram";
+    /// @notice Recommended Discord identity key.
+    string public constant KEY_DISCORD = "discord";
+
+    mapping(address => mapping(uint256 => mapping(string => Record))) private _records;
+
+    error InvalidKey();
+    error InvalidValue();
+    error InvalidBatch();
+    error OwnershipRenunciationDisabled();
+
+    event RecordSet(address indexed collection, uint256 indexed tokenId, bytes32 indexed keyHash, string key, string value, address setBy);
+
+    constructor(IDomixMarketplace marketplace_) {
+        DomixValidation.requireContract(address(marketplace_));
+        marketplace = marketplace_;
+    }
+
+    /// @notice Sets one owner-scoped record; an empty value deletes it.
+    function setRecord(address collection, uint256 tokenId, string calldata key, string calldata value) external {
+        _requireOwner(collection, tokenId);
+        _set(collection, tokenId, key, value);
+    }
+
+    /// @notice Atomically sets up to sixteen records on one owned, allowed, unexpired domain.
+    function setRecords(address collection, uint256 tokenId, string[] calldata keys, string[] calldata values) external {
+        uint256 count = keys.length;
+        if (count == 0 || count > MAX_BATCH || count != values.length) revert InvalidBatch();
+        _requireOwner(collection, tokenId);
+        for (uint256 i; i < count; ++i) _set(collection, tokenId, keys[i], values[i]);
+    }
+
+    /// @notice Returns empty for unallowed/nonexistent/expired names or records set by a different owner.
+    function getRecord(address collection, uint256 tokenId, string calldata key) external view returns (string memory) {
+        _requireKey(key);
+        (bool allowed, bool hasExpiry) = marketplace.collectionInfo(collection);
+        if (!allowed) return "";
+        if (hasExpiry && !DomixValidation.expiryAfter(collection, tokenId, block.timestamp)) return "";
+        address holder = DomixValidation.currentOwner(collection, tokenId);
+        Record storage record = _records[collection][tokenId][key];
+        if (holder == address(0) || record.setBy != holder) return "";
+        return record.value;
+    }
+
+    /// @notice Always reverts: this contract has no ownership or administrator to renounce.
+    function renounceOwnership() external pure { revert OwnershipRenunciationDisabled(); }
+
+    function _requireOwner(address collection, uint256 tokenId) private view {
+        bool hasExpiry = DomixValidation.allowed(marketplace, collection);
+        if (hasExpiry && !DomixValidation.expiryAfter(collection, tokenId, block.timestamp)) {
+            revert DomixValidation.InvalidExpiry();
+        }
+        if (DomixValidation.currentOwner(collection, tokenId) != msg.sender) revert DomixValidation.NotTokenOwner();
+    }
+
+    function _requireKey(string calldata key) private pure {
+        if (bytes(key).length == 0 || bytes(key).length > MAX_KEY_BYTES) revert InvalidKey();
+    }
+
+    function _set(address collection, uint256 tokenId, string calldata key, string calldata value) private {
+        _requireKey(key);
+        if (bytes(value).length > MAX_VALUE_BYTES) revert InvalidValue();
+        if (bytes(value).length == 0) {
+            delete _records[collection][tokenId][key];
+        } else {
+            _records[collection][tokenId][key] = Record(value, msg.sender);
+        }
+        emit RecordSet(collection, tokenId, keccak256(bytes(key)), key, value, msg.sender);
+    }
+}

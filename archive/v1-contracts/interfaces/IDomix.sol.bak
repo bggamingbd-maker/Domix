@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+
+/// @notice Shared configuration and accounting surface; does not register or mint names.
+interface IDomixMarketplace {
+    error PriceAboveMaximum(uint256 price, uint256 maximum);
+
+    function usdc() external view returns (IERC20);
+    function treasury() external view returns (address);
+    function feeBps() external view returns (uint16);
+    function paused() external view returns (bool);
+    function minExpiryBuffer() external view returns (uint64);
+    function collectionInfo(address collection) external view returns (bool allowed, bool hasExpiry);
+    function isSettler(address account) external view returns (bool);
+    function recordExternalSale(address collection, uint256 tokenId, uint256 price, uint256 fee) external;
+}
+
+/// @notice Shared validation for registrar NFTs and six-decimal USDC amounts.
+/// @dev Token IDs are opaque registrar IDs, conventionally uint256(keccak256(bytes(label))).
+library DomixValidation {
+    uint256 internal constant MIN_PRICE = 10_000;
+    uint256 internal constant MAX_FEE_BPS = 1_000;
+    uint256 internal constant BPS = 10_000;
+
+    error ZeroAddress();
+    error NotContract();
+    error InvalidPrice(uint256 supplied, uint256 minimum, uint256 maximum);
+    error InvalidDuration();
+    error CollectionNotAllowed();
+    error InvalidExpiry();
+    error NameExpired(uint256 expiry);
+    error NotTokenOwner();
+    error InvalidFee();
+    error InvalidId();
+    error InvalidStatus();
+    error Expired();
+    error SelfTrade();
+
+    function requireContract(address account) internal view {
+        if (account == address(0)) revert ZeroAddress();
+        if (account.code.length == 0) revert NotContract();
+    }
+
+    function requirePrice(uint256 price) internal pure {
+        if (price < MIN_PRICE || price > type(uint128).max) revert InvalidPrice(price, MIN_PRICE, type(uint128).max);
+    }
+
+    /// @dev Failure, absent code, or malformed return data means no usable expiry information.
+    function expiryAfter(address collection, uint256 tokenId, uint256 threshold) internal view returns (bool) {
+        (bool ok, bytes memory data) = collection.staticcall(
+            abi.encodeWithSignature("nameExpires(uint256)", tokenId)
+        );
+        return ok && data.length == 32 && abi.decode(data, (uint256)) > threshold;
+    }
+
+    /// @dev Missing or malformed expiry data cannot authorize a bid.
+    function requireUnexpired(address collection, uint256 tokenId) internal view {
+        (bool ok, bytes memory data) = collection.staticcall(
+            abi.encodeWithSignature("nameExpires(uint256)", tokenId)
+        );
+        if (!ok || data.length != 32) revert InvalidExpiry();
+        uint256 expiry = abi.decode(data, (uint256));
+        if (expiry <= block.timestamp) revert NameExpired(expiry);
+    }
+
+    /// @notice Returns zero for burned/nonexistent/expired tokens or a reverting registrar.
+    function currentOwner(address collection, uint256 tokenId) internal view returns (address) {
+        if (collection.code.length == 0) return address(0);
+        try IERC721(collection).ownerOf(tokenId) returns (address account) {
+            return account;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function approved(address collection, uint256 tokenId, address account, address operator)
+        internal view returns (bool)
+    {
+        try IERC721(collection).getApproved(tokenId) returns (address single) {
+            if (single == operator) return true;
+        } catch {}
+        try IERC721(collection).isApprovedForAll(account, operator) returns (bool all) {
+            return all;
+        } catch {
+            return false;
+        }
+    }
+
+    function allowed(IDomixMarketplace market, address collection) internal view returns (bool hasExpiry) {
+        (bool enabled, bool expiring) = market.collectionInfo(collection);
+        if (!enabled) revert CollectionNotAllowed();
+        return expiring;
+    }
+}
+
+/// @notice Common two-step administration for DOMIX trading contracts only.
+/// @dev Profiles deliberately does not inherit this base and has no administrator.
+abstract contract DomixAdmin is Ownable2Step, Pausable {
+    uint256 public constant MIN_PRICE = 10_000;
+    uint256 public constant MAX_FEE_BPS = 1_000;
+    uint256 public constant BPS = 10_000;
+
+    error OwnershipRenunciationDisabled();
+
+    constructor(address initialOwner) Ownable(initialOwner) {}
+
+    /// @notice Stops new trading activity; exits follow each trading contract's pause policy.
+    function pause() external virtual onlyOwner { _pause(); }
+
+    /// @notice Resumes new trading activity.
+    function unpause() external virtual onlyOwner { _unpause(); }
+
+    /// @notice Starts a two-step handover to a nonzero owner.
+    function transferOwnership(address newOwner) public override onlyOwner {
+        if (newOwner == address(0)) revert DomixValidation.ZeroAddress();
+        super.transferOwnership(newOwner);
+    }
+
+    /// @notice Ownership cannot be abandoned.
+    function renounceOwnership() public pure override { revert OwnershipRenunciationDisabled(); }
+}

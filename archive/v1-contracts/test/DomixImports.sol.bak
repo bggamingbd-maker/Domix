@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// Convenience re-exports so test files can `import "./DomixImports.sol"` for all symbols.
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC20Errors, IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {IDomixMarketplace, DomixValidation, DomixAdmin} from "../interfaces/IDomix.sol";
+import {DomixMarketplace} from "../DomixMarketplace.sol";
+import {DomixOffers} from "../DomixOffers.sol";
+import {DomixAuction} from "../DomixAuction.sol";
+import {DomixProfiles} from "../DomixProfiles.sol";
+import {BlacklistUSDC, MockUSDC} from "./mocks/MockUSDC.sol";
+import {MockRegistrar} from "./mocks/MockRegistrar.sol";
+import {ContractBidder} from "./mocks/ContractBidder.sol";
